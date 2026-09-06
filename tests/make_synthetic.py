@@ -1,0 +1,52 @@
+"""合成纸质题图：白底 + 黑网格 + 黑白子 + 蓝笔编号，加旋转/噪声模拟实拍。"""
+import cv2
+import numpy as np
+
+GC = "ABCDEFGHJKLMNOPQRST"
+
+
+def make_photo(cols, rows, black, white, digits, out, rot=2.0, noise=True,
+               cell=44, margin=40):
+    """black/white: [(x,y)] 0-based；digits: [(seq,x,y)]。返回图片路径。"""
+    w = (cols - 1) * cell + 2 * margin
+    h = (rows - 1) * cell + 2 * margin
+    img = np.full((h, w, 3), (245, 242, 235), np.uint8)  # 纸色
+
+    def px(x, y):
+        return margin + x * cell, margin + y * cell
+
+    for x in range(cols):
+        cv2.line(img, px(x, 0), px(x, rows - 1), (30, 30, 30), 2)
+    for y in range(rows):
+        cv2.line(img, px(0, y), px(cols - 1, y), (30, 30, 30), 2)
+    r = int(cell * 0.44)
+    for x, y in black:
+        cv2.circle(img, px(x, y), r, (25, 25, 25), -1)
+    for x, y in white:
+        cv2.circle(img, px(x, y), r, (250, 250, 250), -1)
+        cv2.circle(img, px(x, y), r, (60, 60, 60), 1)
+    for seq, x, y in digits:
+        cx, cy = px(x, y)
+        cv2.putText(img, str(seq), (cx - 8, cy + 10),
+                    cv2.FONT_HERSHEY_SIMPLEX, 1.0, (200, 60, 30), 2)  # 蓝笔 BGR
+    if rot:
+        m = cv2.getRotationMatrix2D((w / 2, h / 2), rot, 1.0)
+        img = cv2.warpAffine(img, m, (w, h), borderValue=(245, 242, 235))
+    if noise:
+        img = cv2.GaussianBlur(img, (3, 3), 0.6)
+        img = np.clip(img.astype(int) + np.random.normal(0, 4, img.shape), 0, 255).astype(np.uint8)
+    cv2.imwrite(out, img)
+    return out
+
+
+if __name__ == "__main__":
+    import sys
+    # 题1 风格：7x5 小棋盘，黑白若干，编号 1/2/3
+    make_photo(
+        7, 5,
+        black=[(1, 1), (2, 1), (3, 1), (1, 3), (2, 3)],
+        white=[(1, 2), (2, 2), (3, 2), (4, 2), (3, 3)],
+        digits=[(1, 3, 0), (2, 4, 1), (3, 2, 0)],
+        out=sys.argv[1] if len(sys.argv) > 1 else "/tmp/synth_p1.jpg",
+    )
+    print("written")

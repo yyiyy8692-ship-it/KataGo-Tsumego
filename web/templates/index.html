@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1">
+<title>死活题批改 · 思齐专用</title>
+<link rel="stylesheet" href="/static/style.css">
+</head>
+<body>
+<header>
+  <h1>死活题拍照批改</h1>
+  <div id="steps-bar">
+    <span class="step-dot active" data-s="1">① 拍照</span>
+    <span class="step-dot" data-s="2">② 核对棋形</span>
+    <span class="step-dot" data-s="3">③ 录答案</span>
+    <span class="step-dot" data-s="4">④ 批改</span>
+  </div>
+</header>
+
+<!-- 步骤1：拍照 + 题型 -->
+<section id="step1" class="card">
+  <h2>① 拍照上传</h2>
+  <p class="tip">正对题图、光线均匀、题目完整入镜（别裁掉边上的子）。</p>
+  <label class="file-btn">📷 拍照 / 选照片
+    <input type="file" id="photo" accept="image/*" capture="environment">
+  </label>
+  <img id="preview" class="preview hidden">
+  <h3>题型（必选，系统不猜）</h3>
+  <div class="ptype-row">
+    {% for key, v in ptypes.items() %}
+    <label class="ptype"><input type="radio" name="ptype" value="{{ key }}"> {{ v[2] }}</label>
+    {% endfor %}
+  </div>
+  <input id="note" placeholder="题面提示（可选，如：谨防打劫）">
+  <button id="btn-upload" class="primary" disabled>上传识别</button>
+</section>
+
+<!-- 步骤2：画回确认（硬性门禁） -->
+<section id="step2" class="card hidden">
+  <h2>② 核对棋形 <span class="gate">硬性门禁</span></h2>
+  <p class="tip">对照原题逐子核对。<b>点交叉点可改子</b>：空 → 黑 → 白 → 空。差一子结论就可能翻转，务必一子不差。</p>
+  <div class="board-wrap"><div id="board2"></div></div>
+  <button id="btn-toggle-overlay" class="ghost">查看识别叠加图</button>
+  <img id="overlay-img" class="preview hidden">
+  <button id="btn-confirm" class="primary">✅ 棋形一子不差，下一步</button>
+</section>
+
+<!-- 步骤3：录孩子答案 -->
+<section id="step3" class="card hidden">
+  <h2>③ 录入孩子的答案</h2>
+  <p class="tip">系统识别到的手写编号已标在棋盘上（<b class="warn">?</b> 表示没认出来）。<b>按孩子下的顺序依次点交叉点</b>，颜色自动交替；点错可撤销。</p>
+  <div class="board-wrap"><div id="board3"></div></div>
+  <div id="moves-list" class="moves-list"></div>
+  <div class="row">
+    <button id="btn-undo" class="ghost">↩ 撤销一手</button>
+    <button id="btn-clear" class="ghost">清空</button>
+  </div>
+  <button id="btn-grade" class="primary">开始批改（约 10-30 秒）</button>
+</section>
+
+<!-- 步骤4：批改结果 -->
+<section id="step4" class="card hidden">
+  <h2>④ 批改结果</h2>
+  <div id="alerts"></div>
+  <div id="verdict-box"></div>
+  <div class="board-wrap"><div id="board4"></div></div>
+  <h3>启发引导（先问不答，孩子答出一步再进下一层）</h3>
+  <ol id="hints"></ol>
+  <a id="report-link" class="primary link" target="_blank">查看完整讲题卡 →</a>
+  <button id="btn-restart" class="ghost">再批改一道</button>
+</section>
+
+<div id="loading" class="hidden"><div class="spinner"></div><p id="loading-text">识别中…</p></div>
+<script src="/static/app.js"></script>
+</body>
+</html>

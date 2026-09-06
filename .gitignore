@@ -1,0 +1,18 @@
+__pycache__/
+*.pyc
+*.pyo
+
+# 运行时产物：含孩子作业照片与个人数据，一律不入库
+uploads/
+analysis_logs/
+*.log
+*.log.*
+data/
+*.bak
+
+# 本地虚拟环境
+.venv/
+venv/
+
+.DS_Store
+Thumb.db

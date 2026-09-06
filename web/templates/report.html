@@ -1,0 +1,69 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>讲题卡 · {{ sess.sid }}</title>
+<style>
+  body { font-family: -apple-system, "PingFang SC", serif; background:#f5f0e8; color:#2c2c2c; max-width: 760px; margin: 0 auto; padding: 16px; }
+  h1 { font-size: 20px; } h2 { font-size: 17px; margin: 18px 0 8px; }
+  .card { background:#fff; border-radius:12px; padding:16px; margin:12px 0; box-shadow:0 1px 4px rgba(0,0,0,.08); }
+  .boards { display:flex; gap:12px; flex-wrap:wrap; }
+  .boards > div { flex:1; min-width: 240px; }
+  .alert { background:#fdecea; border:1px solid #C0392B; color:#8f2b20; padding:10px 12px; border-radius:8px; font-size:13px; margin-bottom:8px; }
+  table { width:100%; border-collapse: collapse; font-size: 14px; }
+  td, th { border:1px solid #d8cbb0; padding:6px 8px; text-align:center; }
+  th { background:#fdf6e3; }
+  .good { color:#1e7e34; font-weight:bold; } .bad { color:#C0392B; font-weight:bold; }
+  ol { padding-left: 22px; line-height: 2; font-size: 14px; }
+  .quote { background:#fdf6e3; border-left:4px solid #E9C992; padding:10px 14px; border-radius:0 8px 8px 0; font-size:14px; line-height:1.8; }
+  @media print { body { background:#fff; } .card { box-shadow:none; border:1px solid #ddd; } }
+</style>
+</head>
+<body>
+<h1>讲题卡 · {{ res.type_desc }}</h1>
+<p style="font-size:13px;color:#777">批改时间：{{ sess.get("created","") }}　结论：<b>{{ res.solution.verdict }}</b>
+{% if sess.get("problem_id") %}　已入题库：<b>{{ sess.problem_id }}</b>{% endif %}</p>
+
+{% if res.alerts %}
+<div class="card">
+  {% for a in res.alerts %}<div class="alert">⚠️ {{ a }}</div>{% endfor %}
+</div>
+{% endif %}
+
+<div class="card">
+  <h2>成绩单</h2>
+  <table>
+    <tr><th>项目</th><th>结果</th></tr>
+    <tr><td>正解首着</td><td><b>{{ res.solution.move }}</b>（候选：{% for m, l in res.candidates %}{{ m }} {% endfor %}）</td></tr>
+    {% if res.kid_report %}
+    {% for m in res.kid_report %}
+    <tr><td>孩子 {{ m.seq }}@{{ m.move }}</td>
+      <td>{% if m.is_best %}<span class="good">✓ 引擎首选</span>
+        {% elif m.rank %}第 {{ m.rank }} 选（差 {{ m.lead_gap }} 目）
+        {% else %}<span class="bad">✗ 引擎首选 {{ m.engine_best }}</span>{% endif %}</td></tr>
+    {% endfor %}
+    <tr><td>变化线结局</td><td><b>{{ res.kid_verdict }}</b>（正解结局 {{ res.solution.verdict }}）</td></tr>
+    {% else %}
+    <tr><td>孩子手顺</td><td>未录入</td></tr>
+    {% endif %}
+  </table>
+</div>
+
+<div class="card boards">
+  <div><h2>题目</h2>{{ q_svg | safe }}</div>
+  <div><h2>正解</h2>{{ sol_svg | safe }}</div>
+  {% if kid_svg %}<div><h2>孩子的变化</h2>{{ kid_svg | safe }}</div>{% endif %}
+</div>
+
+<div class="card">
+  <h2>四步启发阶梯（先问不答）</h2>
+  <ol>{% for h in hints %}<li>{{ h }}</li>{% endfor %}</ol>
+</div>
+
+<div class="card">
+  <h2>给孩子的话</h2>
+  <div class="quote">杀棋的点和活棋的点，往往是同一个点——谁先抢到谁赢。下完之后问自己一句：对方最狠的抵抗是什么？</div>
+</div>
+</body>
+</html>
