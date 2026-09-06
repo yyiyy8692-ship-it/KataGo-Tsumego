@@ -399,6 +399,241 @@ def detect_blue_digits(bgr, xs, ys, max_seq=9):
 _DIGIT_TEMPLATES = None
 
 
+def _detect_raw_lines(gray):
+    """HoughLinesP 检所有线段，返回带方向的原始线段列表。
+    [(x1,y1,x2,y2,'h'|'v')] —— 供四角精化做直线拟合用。
+    与 _detect_lines 的区别：那个只返回位置中值，这个保留端点。"""
+    h, w = gray.shape
+    edges = cv2.Canny(gray, 50, 150)
+    lines = cv2.HoughLinesP(edges, 1, np.pi / 180, threshold=60,
+                            minLineLength=w // 8, maxLineGap=10)
+    out = []
+    if lines is not None:
+        for l in lines.reshape(-1, 4):  # cv2 5.x 返回 (N,4)，旧版 (N,1,4)
+            x1, y1, x2, y2 = map(float, l)
+            dx_, dy_ = abs(x2 - x1), abs(y2 - y1)
+            if dy_ < 0.15 * dx_ and dx_ > w // 10:
+                out.append((x1, y1, x2, y2, 'h'))
+            elif dx_ < 0.15 * dy_ and dy_ > h // 10:
+                out.append((x1, y1, x2, y2, 'v'))
+    return out
+
+
+def _fit_line(segs, orient):
+    """一簇线段的所有端点最小二乘拟合一条直线。
+    横线拟合 y = a x + b；竖线拟合 x = c y + d（防斜率爆炸）。
+    返回 (a, b) 使得 orient=='h' 时 y=a x+b，'v' 时 x=a y+b。"""
+    xs, ys = [], []
+    for x1, y1, x2, y2, o in segs:
+        xs += [x1, x2]
+        ys += [y1, y2]
+    xs, ys = np.array(xs), np.array(ys)
+    if len(xs) < 4:
+        return None
+    if orient == 'h':
+        a, b = np.polyfit(xs, ys, 1)
+    else:
+        a, b = np.polyfit(ys, xs, 1)
+    return float(a), float(b)
+
+
+def _fit_line_dark(gray, pos, orient, lo, hi, s):
+    """弱线的暗像素拟合（_fit_line 的回退）。
+    HoughLinesP 检不出的线（被棋子压成碎段达不到 minLineLength），
+    逐行/列取带内暗像素平均位置，再拟合直线。
+    棋子压线处暗像素虽是整颗子，但子是对称圆、均值仍落在线上，不会带歪。
+    返回 (a, b, 覆盖率)；覆盖率 <0.3 说明带内根本没有线，返回 None。"""
+    h, w = gray.shape
+    band = max(int(s * 0.2), 4)
+    dark = gray < 150
+    lo, hi = max(int(lo), 0), min(int(hi), gray.shape[0 if orient == 'v' else 1])
+    pts_a, pts_b = [], []
+    n_rows = 0
+    if orient == 'v':
+        x0 = max(int(pos - band), 0)
+        x1 = min(int(pos + band), w)
+        for y in range(lo, hi):
+            idx = np.where(dark[y, x0:x1])[0]
+            if len(idx):
+                pts_a.append(float(idx.mean()) + x0)
+                pts_b.append(float(y))
+                n_rows += 1
+        total = hi - lo
+    else:
+        y0 = max(int(pos - band), 0)
+        y1 = min(int(pos + band), h)
+        for x in range(lo, hi):
+            idx = np.where(dark[y0:y1, x])[0]
+            if len(idx):
+                pts_a.append(float(x))
+                pts_b.append(float(idx.mean()) + y0)
+                n_rows += 1
+        total = hi - lo
+    if total <= 0 or n_rows / total < 0.3 or len(pts_a) < 4:
+        return None
+    a, b = np.polyfit(np.array(pts_b), np.array(pts_a), 1)
+    return (float(a), float(b), n_rows / total)
+
+
+def _refine_corners(gray, xs, ys):
+    """四角精化：最外 4 条印刷线各自拟合真直线，两两求交得四角。
+
+    为什么必须做（GitHub 五个围棋识别项目的共识）：透视变换保直线，
+    所以每条印刷线在照片里仍是一条直线——4 条最外线的交点就是精确四角。
+    而均匀网格假设在透视下系统性失真（实测角点拟合偏差 6.5-9px），
+    直接拿 xs/ys 外推四角会把 warp 也带歪。失败返回 None（走回退路径）。"""
+    s = float(np.median(np.diff(xs))) if len(xs) > 1 else 30
+    raw = _detect_raw_lines(gray)
+    if not raw:
+        return None
+
+    def cluster_near(target, orient):
+        tol = s * 0.6
+        segs = []
+        for x1, y1, x2, y2, o in raw:
+            if o != orient:
+                continue
+            pos = (y1 + y2) / 2 if orient == 'h' else (x1 + x2) / 2
+            if abs(pos - target) < tol:
+                segs.append((x1, y1, x2, y2, o))
+        return segs
+
+    def edge_line(target, orient, lo, hi):
+        """先 HoughLinesP 段拟合，段不足回退暗像素拟合（弱线被压碎段）。"""
+        segs = cluster_near(target, orient)
+        fit = _fit_line(segs, orient) if len(segs) >= 2 else None
+        if fit is None:
+            dark_fit = _fit_line_dark(gray, target, orient, lo, hi, s)
+            fit = (dark_fit[0], dark_fit[1]) if dark_fit else None
+        return fit
+
+    top = edge_line(ys[0], 'h', xs[0], xs[-1])
+    bot = edge_line(ys[-1], 'h', xs[0], xs[-1])
+    left = edge_line(xs[0], 'v', ys[0], ys[-1])
+    right = edge_line(xs[-1], 'v', ys[0], ys[-1])
+    if None in (top, bot, left, right):
+        return None
+
+    def intersect(hline, vline):
+        """y = ah x + bh 与 x = av y + bv 的交点。"""
+        ah, bh = hline
+        av, bv = vline
+        # x = av (ah x + bh) + bv  =>  x (1 - av ah) = av bh + bv
+        denom = 1 - av * ah
+        if abs(denom) < 1e-6:
+            return None
+        x = (av * bh + bv) / denom
+        y = ah * x + bh
+        return (float(x), float(y))
+
+    corners = [intersect(top, left), intersect(top, right),
+               intersect(bot, left), intersect(bot, right)]
+    if None in corners:
+        return None
+    tl, tr, bl, br = corners
+    # 合理性：对边长度比、边与 xs/ys 的端点距离
+    w_top = np.hypot(tr[0] - tl[0], tr[1] - tl[1])
+    w_bot = np.hypot(br[0] - bl[0], br[1] - bl[1])
+    h_left = np.hypot(bl[0] - tl[0], bl[1] - tl[1])
+    h_right = np.hypot(br[0] - tr[0], br[1] - tr[1])
+    if min(w_top, w_bot) < 0.5 * max(w_top, w_bot):
+        return None
+    if min(h_left, h_right) < 0.5 * max(h_left, h_right):
+        return None
+    expect_w = (len(xs) - 1) * s
+    expect_h = (len(ys) - 1) * s
+    if not (0.6 * expect_w < (w_top + w_bot) / 2 < 1.4 * expect_w):
+        return None
+    if not (0.6 * expect_h < (h_left + h_right) / 2 < 1.4 * expect_h):
+        return None
+    return np.float32([tl, tr, bl, br])
+
+
+_WARP_CELL = 44      # warp 后每格固定 44px：下游所有像素阈值变常量
+_WARP_MARGIN = 36    # warp 后四周留白
+
+
+def _warp_board(bgr, quad, cols, rows):
+    """逆透视变换把棋盘拉正成等距正方形网格（最佳实践核心步骤）。
+    返回 (warp_bgr, xs, ys)：网格位置变成 margin + i*cell 的精确等距。"""
+    w = (cols - 1) * _WARP_CELL + 2 * _WARP_MARGIN
+    h = (rows - 1) * _WARP_CELL + 2 * _WARP_MARGIN
+    m = float(_WARP_MARGIN)
+    dst = np.float32([[m, m], [w - m, m], [m, h - m], [w - m, h - m]])
+    M = cv2.getPerspectiveTransform(quad, dst)
+    warped = cv2.warpPerspective(bgr, M, (w, h),
+                                 borderValue=(245, 242, 235))
+    xs = [m + i * _WARP_CELL for i in range(cols)]
+    ys = [m + j * _WARP_CELL for j in range(rows)]
+    return warped, xs, ys
+
+
+def _extend_grid_edges(gray, xs, ys):
+    """边缘无子列/行的补救：最外线到图边还有 >0.7s 空间时，
+    在外推位置验证是否有弱线证据（被棋子压断的线覆盖率仍应 >35%），
+    有则补一列/行，每侧最多补 2 条。
+
+    透视下最外竖线常被压缩导致 HoughLinesP 检不出（实测 6% 透视丢最左列），
+    而该列无子就没有圆心证据，点阵拟合的证据范围裁剪（±0.3s）会把它裁掉，
+    整盘坐标系统性错位一列。此处用暗像素行/列覆盖率做弱证据验证。"""
+    h, w = gray.shape
+    if len(xs) < 2 or len(ys) < 2:
+        return xs, ys
+    s = float(np.median(np.diff(xs)))
+    xs, ys = list(xs), list(ys)
+    dark = gray < 150
+
+    def line_evidence(pos, orient, lo, hi):
+        band = max(int(s * 0.18), 3)
+        if orient == 'v':
+            x0, x1 = max(int(pos - band), 0), min(int(pos + band), w)
+            if x1 - x0 < 2:
+                return 0.0
+            strip = dark[max(int(lo), 0):min(int(hi), h), x0:x1]
+            return float(np.mean(strip.any(axis=1))) if strip.size else 0.0
+        y0, y1 = max(int(pos - band), 0), min(int(pos + band), h)
+        if y1 - y0 < 2:
+            return 0.0
+        strip = dark[y0:y1, max(int(lo), 0):min(int(hi), w)]
+        return float(np.mean(strip.any(axis=0))) if strip.size else 0.0
+
+    for _ in range(2):
+        grew = False
+        if xs[0] - s > 10 and line_evidence(xs[0] - s, 'v', ys[0], ys[-1]) > 0.35:
+            xs.insert(0, xs[0] - s); grew = True
+        if xs[-1] + s < w - 10 and line_evidence(xs[-1] + s, 'v', ys[0], ys[-1]) > 0.35:
+            xs.append(xs[-1] + s); grew = True
+        if ys[0] - s > 10 and line_evidence(ys[0] - s, 'h', xs[0], xs[-1]) > 0.35:
+            ys.insert(0, ys[0] - s); grew = True
+        if ys[-1] + s < h - 10 and line_evidence(ys[-1] + s, 'h', xs[0], xs[-1]) > 0.35:
+            ys.append(ys[-1] + s); grew = True
+        if not grew:
+            break
+    return xs, ys
+
+
+def _merge_digits(*digit_lists):
+    """多源数字识别结果按交叉点取优。
+    规则（实测标定）：有读数永远优先于 "?"，同级才按 conf——
+    因为 "?" 的 conf 是双门槛拦截前的原始分，可能比正确答案的 conf 还高，
+    纯按 conf 会让 "?" 把读对的答案挤掉（实测 6% 透视融合后 40/60 < 单源 48/60）。
+    warp 后图（透视已矫正）与原图（无插值模糊）各有优势场景，融合取两者长处。"""
+    best = {}
+    for lst in digit_lists:
+        for d in lst:
+            key = (d[1], d[2])
+            cur = best.get(key)
+            if cur is None:
+                best[key] = d
+            elif d[0] is not None and cur[0] is None:
+                best[key] = d
+            elif d[0] is None and cur[0] is not None:
+                pass
+            elif d[3] > cur[3]:
+                best[key] = d
+    return sorted(best.values(), key=lambda t: (t[0] is None, t[0] or 99))
+
+
 def _digit_templates():
     """cv2 渲染 1-9 模板（多字号多粗细），懒加载。
     手写体与印刷体差异大，识别率低是预期——低置信一律标 ? 走人工确认。"""
@@ -443,7 +678,14 @@ def _classify_digit(patch):
 
 
 def recognize(photo_path):
-    """主入口。返回 dict：网格线数、黑白子（网格坐标）、蓝字编号、叠加核对图路径。"""
+    """主入口。返回 dict：网格线数、黑白子（网格坐标）、蓝字编号、叠加核对图路径。
+
+    V2 管线（对标 GitHub 围棋识别最佳实践 GoChessParse/image2sgf/GOimage2SGF）：
+    1. 粗网格检测（detect_grid）拿行列数和粗网格
+    2. 四角精化（最外 4 条印刷线拟合求交）→ 逆透视变换拉正
+    3. warp 后网格严格等距（cell=44 常量），全交叉点扫描分类
+    4. 蓝字编号也在 warp 后图上识别（透视被矫正，模板匹配更准）
+    四角精化失败回退旧路径（原图均匀网格），保证不回归。"""
     bgr = cv2.imread(photo_path)
     if bgr is None:
         raise ValueError("照片读取失败")
@@ -462,8 +704,25 @@ def recognize(photo_path):
     if out is None:
         raise ValueError("未检测到棋盘网格，请重拍（正对题图、光线均匀、题图完整入镜）")
     xs, ys, centers = out
+    xs, ys = _extend_grid_edges(gray_cls, xs, ys)
+
+    # 原图留档：数字识别融合用（正视角下原图无插值模糊，数字更准）
+    orig_bgr, orig_xs, orig_ys = bgr, list(xs), list(ys)
+
+    quad = _refine_corners(gray_cls, xs, ys)
+    if quad is not None:
+        # V2 主路径：逆透视拉正，网格变成精确等距常量
+        wb, xs, ys = _warp_board(bgr, quad, len(xs), len(ys))
+        gray_cls = cv2.cvtColor(wb, cv2.COLOR_BGR2GRAY)
+        gray_cls[_blue_mask(wb) > 0] = 255
+        bgr = wb
+
     black, white, marks = classify_by_sweep(gray_cls, xs, ys)
-    digits = detect_blue_digits(bgr, xs, ys)
+    if quad is not None:
+        digits = _merge_digits(detect_blue_digits(orig_bgr, orig_xs, orig_ys),
+                               detect_blue_digits(bgr, xs, ys))
+    else:
+        digits = detect_blue_digits(bgr, xs, ys)
 
     overlay = bgr.copy()
     for x in xs:
