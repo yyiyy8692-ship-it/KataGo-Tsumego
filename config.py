@@ -9,15 +9,14 @@
 """
 import os
 
-KATAGO = os.environ.get(
-    "KATAGO_BIN", "/Users/yangyang/homebrew/bin/katago")
+KATAGO = os.environ.get("KATAGO_BIN", os.path.expanduser("~/homebrew/bin/katago"))
 MODEL = os.environ.get(
     "KATAGO_MODEL",
-    "/Users/yangyang/katago/kata1-b18c384nbt-s9996604416-d4316597426.bin.gz")
+    os.path.expanduser("~/katago/kata1-b18c384nbt-s9996604416-d4316597426.bin.gz"))
 CONFIG = os.environ.get(
-    "KATAGO_CONFIG", "/Users/yangyang/katago/configs/analysis_example.cfg")
+    "KATAGO_CONFIG", os.path.expanduser("~/katago/configs/analysis_example.cfg"))
 
-_DATA = os.environ.get("TSUME_DATA_DIR", "/Users/yangyang/go-review/data")
+_DATA = os.environ.get("TSUME_DATA_DIR", os.path.expanduser("~/go-review/data"))
 PROBLEMS = os.path.join(_DATA, "problems.json")
 PHOTOS = os.path.join(_DATA, "photos")
 

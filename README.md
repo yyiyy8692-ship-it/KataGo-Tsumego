@@ -71,9 +71,11 @@ export TSUME_PORT=5050
 
 **4. 开机自启（macOS）**
 
+先把 `deploy/com.tsume.app.plist` 里的 `CHANGE_ME` 换成你的用户名与实际项目路径，然后：
+
 ```bash
-cp deploy/com.yangyang.tsume.plist ~/Library/LaunchAgents/
-launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.yangyang.tsume.plist
+cp deploy/com.tsume.app.plist ~/Library/LaunchAgents/
+launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.tsume.app.plist
 ```
 
 ## 测试

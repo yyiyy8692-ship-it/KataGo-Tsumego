@@ -1,4 +1,4 @@
-"""批改结果自动归档进题库 /Users/yangyang/go-review/data/problems.json。
+"""批改结果自动归档进题库 ~/go-review/data/problems.json。
 
 小棋盘坐标 -> 19 路坐标：锚定右上角（列从 T 往左排，行从 19 往下排），
 与题库 H 系列（作业实拍题）的坐标习惯一致。

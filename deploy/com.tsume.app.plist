@@ -1,0 +1,16 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key><string>com.tsume.app</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>/Users/CHANGE_ME/tsume-app/start.sh</string>
+  </array>
+  <key>WorkingDirectory</key><string>/Users/CHANGE_ME/tsume-app</string>
+  <key>RunAtLoad</key><true/>
+  <key>KeepAlive</key><true/>
+  <key>StandardOutPath</key><string>/Users/CHANGE_ME/tsume-app/app.log</string>
+  <key>StandardErrorPath</key><string>/Users/CHANGE_ME/tsume-app/app.log</string>
+</dict>
+</plist>
