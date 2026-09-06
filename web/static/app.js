@@ -55,23 +55,32 @@ function renderBoard(el, cols, rows, stoneMap, labels, onClick) {
 }
 
 /* ---------- 步骤1：上传 ---------- */
-$("#photo").addEventListener("change", e => {
-  const f = e.target.files[0];
-  if (!f) return;
-  const img = $("#preview");
-  img.src = URL.createObjectURL(f);
-  img.classList.remove("hidden");
-  checkReady();
+/* 拍照（capture 强制调起相机）与相册（无 capture）分开两个入口：
+   手机浏览器只要 input 带 capture 属性就直接打开相机、不给相册选项 */
+function currentPhoto() {
+  return $("#photo-cam").files[0] || $("#photo-album").files[0] || null;
+}
+["#photo-cam", "#photo-album"].forEach(sel => {
+  $(sel).addEventListener("change", e => {
+    const f = e.target.files[0];
+    if (!f) return;
+    // 清掉另一个入口，避免两张照片歧义
+    (sel === "#photo-cam" ? $("#photo-album") : $("#photo-cam")).value = "";
+    const img = $("#preview");
+    img.src = URL.createObjectURL(f);
+    img.classList.remove("hidden");
+    checkReady();
+  });
 });
 document.querySelectorAll("input[name=ptype]").forEach(r =>
   r.addEventListener("change", checkReady));
 function checkReady() {
-  $("#btn-upload").disabled = !($("#photo").files[0] &&
+  $("#btn-upload").disabled = !(currentPhoto() &&
     document.querySelector("input[name=ptype]:checked"));
 }
 $("#btn-upload").addEventListener("click", async () => {
   const fd = new FormData();
-  fd.append("photo", $("#photo").files[0]);
+  fd.append("photo", currentPhoto());
   fd.append("ptype", document.querySelector("input[name=ptype]:checked").value);
   fd.append("note", $("#note").value);
   loading(true, "识别棋形中…");

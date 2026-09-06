@@ -21,9 +21,14 @@
 <section id="step1" class="card">
   <h2>① 拍照上传</h2>
   <p class="tip">正对题图、光线均匀、题目完整入镜（别裁掉边上的子）。</p>
-  <label class="file-btn">📷 拍照 / 选照片
-    <input type="file" id="photo" accept="image/*" capture="environment">
-  </label>
+  <div class="row photo-row">
+    <label class="file-btn">📷 拍照
+      <input type="file" id="photo-cam" accept="image/*" capture="environment">
+    </label>
+    <label class="file-btn">🖼 从相册选择
+      <input type="file" id="photo-album" accept="image/*">
+    </label>
+  </div>
   <img id="preview" class="preview hidden">
   <h3>题型（必选，系统不猜）</h3>
   <div class="ptype-row">

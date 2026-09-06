@@ -13,6 +13,8 @@ h3 { font-size: 15px; margin: 14px 0 8px; }
 .warn { color: #C0392B; }
 .file-btn { display: block; text-align: center; padding: 16px; border: 2px dashed #b8a67a; border-radius: 10px; font-size: 16px; margin-bottom: 12px; cursor: pointer; }
 .file-btn input { display: none; }
+.photo-row { gap: 10px; }
+.photo-row .file-btn { flex: 1; padding: 16px 6px; font-size: 15px; }
 .preview { width: 100%; border-radius: 8px; margin: 10px 0; }
 .ptype-row { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; margin-bottom: 12px; }
 .ptype { padding: 12px; border: 1.5px solid #d8cbb0; border-radius: 8px; text-align: center; font-size: 15px; }
