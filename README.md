@@ -69,7 +69,22 @@ export TSUME_PORT=5050
 
 手机连同一 Wi-Fi，浏览器打开 `http://<本机局域网 IP>:5050`。
 
-**4. 开机自启（macOS）**
+**3b. 外网访问（不在家、手机走 5G）**
+
+局域网 IP 出了家门就失效。推荐 **Tailscale**（组网 VPN，免费，个人用途足够）：Mac 与手机装同一个账号，
+手机用 Tailscale 分配给 Mac 的 IP（或 MagicDNS 名）访问即可，流量端到端加密、不暴露到公网。
+
+```bash
+tailscale ip -4            # 例如 100.123.33.16
+```
+手机浏览器打开 `http://<Tailscale IP>:5050`（需先在手机 Tailscale App 里点"连接"）。
+
+其他方案的取舍：
+- **Cloudflare Tunnel**：手机不用装 App，但需要域名 + Cloudflare 账号，且服务会暴露到公网，必须加一层鉴权。
+- **路由器端口映射 + DDNS**：需要运营商给的是真公网 IP（很多宽带是 CGNAT，映射了也不通），且直接暴露到互联网，不推荐。
+- **公网 IPv6 直连**：取决于运营商和路由器是否放行入站，地址还会变，不够省心。
+
+> 无论哪种方案，**Mac 不能睡**：`pmset -g` 里 `sleep` 为 0 才靠谱。服务本身用 launchd 常驻（见下）。
 
 先把 `deploy/com.tsume.app.plist` 里的 `CHANGE_ME` 换成你的用户名与实际项目路径，然后：
 
