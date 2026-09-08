@@ -1,6 +1,7 @@
-/* 死活题批改前端：四步流程 */
+/* 死活题批改前端：四步流程（一图多题时步骤①后多一个选题页） */
 const GC = "ABCDEFGHJKLMNOPQRST";
 let SID = null, REC = null, PTYPE = null;
+let BOARDS = null, BOARD = null, DONE = new Set();  // 多题状态
 let stones = {};          // "x,y" -> "B"/"W"（确认用）
 let kidMoves = [];        // [{seq,color,x,y}]
 let digits = [];          // 识别到的手写编号
@@ -14,8 +15,9 @@ const loading = (on, text) => {
 };
 const setStep = n => {
   document.querySelectorAll(".step-dot").forEach(d =>
-    d.classList.toggle("active", +d.dataset.s <= n));
-  [1,2,3,4].forEach(i => (i === n ? show("#step"+i) : hide("#step"+i)));
+    d.classList.toggle("active", +d.dataset.s <= (n === "1b" ? 1 : n)));
+  ["1", "1b", "2", "3", "4"].forEach(i =>
+    (i === String(n) ? show("#step" + i) : hide("#step" + i)));
 };
 
 /* ---------- SVG 棋盘 ---------- */
@@ -87,17 +89,58 @@ $("#btn-upload").addEventListener("click", async () => {
   const res = await fetch("/api/upload", {method:"POST", body:fd}).then(r=>r.json());
   loading(false);
   if (res.error) { alert(res.error); return; }
-  SID = res.sid; REC = res.rec; PTYPE = fd.get("ptype");
-  $("#overlay-img").src = res.overlay_url;
+  SID = res.sid; PTYPE = fd.get("ptype");
+  BOARDS = null; BOARD = null; DONE = new Set();
+  if (res.multi) {
+    BOARDS = res.boards;
+    showPicker();
+    return;
+  }
+  REC = res.rec;
+  enterStep2(res.overlay_url);
+});
+
+/* ---------- 多题选择 ---------- */
+function showPicker() {
+  const grid = $("#board-grid");
+  grid.innerHTML = "";
+  BOARDS.forEach((b, i) => {
+    const cell = document.createElement("div");
+    cell.className = "board-cell" + (DONE.has(i) ? " done" : "");
+    cell.innerHTML =
+      `<img src="${b.thumb_url}">` +
+      `<div class="board-cap">${DONE.has(i) ? "✅ 已批改" : "第 " + (i+1) + " 题"}` +
+      `${b.error ? ' <span class="warn">识别失败</span>' : ""}</div>`;
+    cell.addEventListener("click", () => selectBoard(i));
+    grid.appendChild(cell);
+  });
+  $("#multi-count").textContent = `${BOARDS.length} 道题`;
+  setStep("1b");
+}
+function selectBoard(i) {
+  const b = BOARDS[i];
+  if (b.error) { alert("这道题识别失败：" + b.error + "，请单独重拍这一题"); return; }
+  BOARD = i;
+  REC = b.rec;
+  enterStep2(b.overlay_url);
+}
+
+/* ---------- 步骤2：棋形确认 ---------- */
+function enterStep2(overlayUrl) {
+  $("#overlay-img").src = overlayUrl || "";
   stones = {};
   REC.black.forEach(([x,y]) => stones[x+","+y] = "B");
   REC.white.forEach(([x,y]) => stones[x+","+y] = "W");
   digits = REC.digits || [];
+  // 题型下拉：默认整页统一的选择，每题可改
+  const sel = $("#ptype-override");
+  sel.innerHTML = Object.entries(PTYPES).map(([k, v]) =>
+    `<option value="${k}" ${k === PTYPE ? "selected" : ""}>${v}</option>`).join("");
+  $("#board-tag").classList.toggle("hidden", !BOARDS);
+  if (BOARDS) $("#board-tag").textContent = `第 ${BOARD + 1} / ${BOARDS.length} 题`;
   drawStep2();
   setStep(2);
-});
-
-/* ---------- 步骤2：棋形确认 ---------- */
+}
 function drawStep2() {
   renderBoard($("#board2"), REC.cols, REC.rows, stones, digitLabels(), (x,y) => {
     const k = x+","+y;
@@ -119,9 +162,12 @@ $("#btn-confirm").addEventListener("click", async () => {
   const black = [], white = [];
   for (const k in stones) { const [x,y] = k.split(",").map(Number);
     (stones[k]==="B"?black:white).push([x,y]); }
+  PTYPE = $("#ptype-override").value || PTYPE;  // 每题可覆盖的题型
+  const body = {sid:SID, black, white, ptype:PTYPE};
+  if (BOARDS) body.board = BOARD;
   loading(true);
   await fetch("/api/confirm", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sid:SID, black, white})});
+    body: JSON.stringify(body)});
   loading(false);
   kidMoves = [];
   drawStep3();
@@ -151,12 +197,18 @@ $("#btn-undo").addEventListener("click", () => { kidMoves.pop(); drawStep3(); })
 $("#btn-clear").addEventListener("click", () => { kidMoves = []; drawStep3(); });
 $("#btn-grade").addEventListener("click", async () => {
   loading(true, "KataGo 计算中（逐手验证孩子变化线）…");
+  const body = {sid:SID, kid_moves:kidMoves};
+  if (BOARDS) body.board = BOARD;
   const res = await fetch("/api/grade", {method:"POST", headers:{"Content-Type":"application/json"},
-    body: JSON.stringify({sid:SID, kid_moves:kidMoves})}).then(r=>r.json());
+    body: JSON.stringify(body)}).then(r=>r.json());
   loading(false);
   if (res.error) { alert(res.error); return; }
   drawResult(res);
   setStep(4);
+});
+$("#btn-next").addEventListener("click", () => {
+  DONE.add(BOARD);
+  showPicker();
 });
 
 /* ---------- 步骤4：结果 ---------- */
@@ -182,6 +234,7 @@ function drawResult(res) {
   const sm = {...stones};
   kidMoves.forEach(m => sm[m.x+","+m.y] = m.color);
   renderBoard($("#board4"), REC.cols, REC.rows, sm, L, null);
-  $("#report-link").href = "/report/" + SID;
+  $("#report-link").href = "/report/" + SID + (BOARDS ? "/" + BOARD : "");
+  $("#btn-next").classList.toggle("hidden", !BOARDS);
 }
 $("#btn-restart").addEventListener("click", () => location.reload());

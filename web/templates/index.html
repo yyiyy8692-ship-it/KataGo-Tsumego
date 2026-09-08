@@ -40,10 +40,22 @@
   <button id="btn-upload" class="primary" disabled>上传识别</button>
 </section>
 
+<!-- 步骤1b：多题选择（一图多题时出现） -->
+<section id="step1b" class="card hidden">
+  <h2>选择要批改的题</h2>
+  <p class="tip">这张照片里检测到 <b id="multi-count"></b>。点选一道开始批改；改完一道回来选下一道，不用重拍。</p>
+  <div id="board-grid"></div>
+</section>
+
 <!-- 步骤2：画回确认（硬性门禁） -->
 <section id="step2" class="card hidden">
-  <h2>② 核对棋形 <span class="gate">硬性门禁</span></h2>
+  <h2>② 核对棋形 <span class="gate">硬性门禁</span> <span id="board-tag" class="board-tag hidden"></span></h2>
   <p class="tip">对照原题逐子核对。<b>点交叉点可改子</b>：空 → 黑 → 白 → 空。差一子结论就可能翻转，务必一子不差。</p>
+  <div class="ptype-override">
+    本题题型：
+    <select id="ptype-override"></select>
+    <span class="tip-inline">（默认整页统一，一页混了杀/活题时在这改）</span>
+  </div>
   <div class="board-wrap"><div id="board2"></div></div>
   <button id="btn-toggle-overlay" class="ghost">查看识别叠加图</button>
   <img id="overlay-img" class="preview hidden">
@@ -72,10 +84,12 @@
   <h3>启发引导（先问不答，孩子答出一步再进下一层）</h3>
   <ol id="hints"></ol>
   <a id="report-link" class="primary link" target="_blank">查看完整讲题卡 →</a>
+  <button id="btn-next" class="ghost hidden">📋 批改下一道</button>
   <button id="btn-restart" class="ghost">再批改一道</button>
 </section>
 
 <div id="loading" class="hidden"><div class="spinner"></div><p id="loading-text">识别中…</p></div>
+<script>const PTYPES = {{ ptypes_json|safe }};</script>
 <script src="/static/app.js"></script>
 </body>
 </html>

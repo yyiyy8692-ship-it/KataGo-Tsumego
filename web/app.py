@@ -12,7 +12,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from flask import Flask, jsonify, render_template, request, send_file, abort
 
 import config
-from recognition.detect import recognize
+from recognition.detect import recognize, split_boards
 from recognition.render import board_svg
 from grader.grader import grade, hints_for, PROBLEM_TYPES
 
@@ -42,7 +42,25 @@ def _save(sid, data):
 
 @app.route("/")
 def index():
-    return render_template("index.html", ptypes=PROBLEM_TYPES)
+    import json as _json
+    return render_template("index.html", ptypes=PROBLEM_TYPES,
+                           ptypes_json=_json.dumps(
+                               {k: v[2] for k, v in PROBLEM_TYPES.items()}))
+
+
+def _board_ctx(sess, j):
+    """单题会话返回 sess 本身；多题会话返回第 board 个棋盘子 dict（就地改，
+    _save 后落盘）。"""
+    if sess.get("multi"):
+        try:
+            i = int(j.get("board", 0) or 0)
+        except (TypeError, ValueError):
+            abort(400)
+        boards = sess["boards"]
+        if not (0 <= i < len(boards)):
+            abort(400)
+        return boards[i]
+    return sess
 
 
 @app.route("/api/upload", methods=["POST"])
@@ -57,16 +75,47 @@ def upload():
     path = os.path.join(d, "photo.jpg")
     photo.save(path)
     try:
-        rec = recognize(path)
+        crops = split_boards(path)  # 一图多题切分；单棋盘返回 [原图]
     except ValueError as e:
         return jsonify({"error": str(e)}), 422
+    except Exception:
+        crops = [path]
+    if len(crops) == 1:
+        try:
+            rec = recognize(path)
+        except ValueError as e:
+            return jsonify({"error": str(e)}), 422
+        sess = {"sid": sid, "ptype": ptype, "note": request.form.get("note", ""),
+                "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
+                "photo": path, "rec": {k: v for k, v in rec.items() if k != "overlay"},
+                "overlay": os.path.basename(rec["overlay"])}
+        _save(sid, sess)
+        return jsonify({"sid": sid, "rec": sess["rec"],
+                        "overlay_url": f"/file/{sid}/{sess['overlay']}"})
+    # 多题：逐题识别（识别失败的单题保留 error，前端标出但不阻塞其他题）
+    boards = []
+    for cp in crops:
+        b = {"photo": cp}
+        try:
+            rec = recognize(cp)
+            b["rec"] = {k: v for k, v in rec.items() if k != "overlay"}
+            b["overlay"] = os.path.basename(rec["overlay"])
+        except ValueError as e:
+            b["error"] = str(e)
+        boards.append(b)
+    if not any("rec" in b for b in boards):
+        return jsonify({"error": "未检测到棋盘网格，请重拍（正对题图、光线均匀、题图完整入镜）"}), 422
     sess = {"sid": sid, "ptype": ptype, "note": request.form.get("note", ""),
             "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
-            "photo": path, "rec": {k: v for k, v in rec.items() if k != "overlay"},
-            "overlay": os.path.basename(rec["overlay"])}
+            "photo": path, "multi": True, "boards": boards}
     _save(sid, sess)
-    return jsonify({"sid": sid, "rec": sess["rec"],
-                    "overlay_url": f"/file/{sid}/{sess['overlay']}"})
+    return jsonify({
+        "sid": sid, "multi": True, "ptype": ptype,
+        "boards": [{"rec": b.get("rec"), "error": b.get("error"),
+                    "thumb_url": f"/file/{sid}/{os.path.basename(b['photo'])}",
+                    "overlay_url": (f"/file/{sid}/{b['overlay']}"
+                                    if "overlay" in b else None)}
+                   for b in boards]})
 
 
 @app.route("/file/<sid>/<name>")
@@ -78,11 +127,17 @@ def file(sid, name):
 
 @app.route("/api/confirm", methods=["POST"])
 def confirm():
-    """画回确认门禁：家长确认/修改后的棋形才进入批改。"""
+    """画回确认门禁：家长确认/修改后的棋形才进入批改。
+    多题会话需带 board 序号；ptype 可在此按题覆盖（默认整页统一）。"""
     j = request.get_json(force=True)
     sess = _load(j["sid"])
-    sess["confirmed"] = {"black": [tuple(p) for p in j["black"]],
-                         "white": [tuple(p) for p in j["white"]]}
+    ctx = _board_ctx(sess, j)
+    if "rec" not in ctx:
+        return jsonify({"error": "该题识别失败，请单独重拍这一题"}), 400
+    ctx["confirmed"] = {"black": [tuple(p) for p in j["black"]],
+                        "white": [tuple(p) for p in j["white"]]}
+    if j.get("ptype") in PROBLEM_TYPES:
+        ctx["ptype"] = j["ptype"]
     _save(j["sid"], sess)
     return jsonify({"ok": True})
 
@@ -91,42 +146,58 @@ def confirm():
 def do_grade():
     j = request.get_json(force=True)
     sess = _load(j["sid"])
-    if "confirmed" not in sess:
+    ctx = _board_ctx(sess, j)
+    if "confirmed" not in ctx:
         return jsonify({"error": "请先确认棋形（画回确认是硬性门禁）"}), 400
-    rec = sess["rec"]
+    rec = ctx["rec"]
+    ptype = ctx.get("ptype", sess["ptype"])
     kid = [(m["seq"], m["color"], m["x"], m["y"]) for m in j.get("kid_moves", [])]
     try:
         result = grade(rec["cols"], rec["rows"],
-                       sess["confirmed"]["black"], sess["confirmed"]["white"],
-                       sess["ptype"], kid, note=sess.get("note", ""))
+                       ctx["confirmed"]["black"], ctx["confirmed"]["white"],
+                       ptype, kid, note=sess.get("note", ""))
     except RuntimeError as e:
         return jsonify({"error": str(e)}), 500
-    sess["kid_moves"] = j.get("kid_moves", [])
-    sess["result"] = result
+    ctx["kid_moves"] = j.get("kid_moves", [])
+    ctx["result"] = result
     if j.get("archive", True):  # 测试时可传 archive:false 免污染题库
         try:
             from grader.archive import archive
-            sess["problem_id"] = archive(sess, result)
+            # archive 需要 {rec, ptype, confirmed, note, photo} 形状的视图
+            view = {"rec": rec, "ptype": ptype, "note": sess.get("note", ""),
+                    "confirmed": ctx["confirmed"], "photo": ctx.get("photo", sess["photo"])}
+            ctx["problem_id"] = archive(view, result)
         except Exception as e:
-            sess["archive_error"] = str(e)  # 归档失败不阻塞批改
+            ctx["archive_error"] = str(e)  # 归档失败不阻塞批改
     _save(j["sid"], sess)
-    return jsonify({"result": result, "hints": hints_for(sess["ptype"]),
-                    "problem_id": sess.get("problem_id")})
+    return jsonify({"result": result, "hints": hints_for(ptype),
+                    "problem_id": ctx.get("problem_id")})
 
 
 @app.route("/report/<sid>")
-def report(sid):
+@app.route("/report/<sid>/<int:bi>")
+def report(sid, bi=None):
     sess = _load(sid)
-    if "result" not in sess:
+    ctx = sess
+    if sess.get("multi"):
+        boards = sess["boards"]
+        if bi is None:  # 未指定时给第一道已批改的题
+            ctx = next((b for b in boards if "result" in b), None)
+        elif 0 <= bi < len(boards):
+            ctx = boards[bi]
+        if ctx is None or "result" not in ctx:
+            abort(404)
+    if "result" not in ctx:
         abort(404)
-    rec, res = sess["rec"], sess["result"]
+    rec, res = ctx["rec"], ctx["result"]
+    ptype = ctx.get("ptype", sess["ptype"])
     cols, rows = rec["cols"], rec["rows"]
-    black = [tuple(p) for p in sess["confirmed"]["black"]]
-    white = [tuple(p) for p in sess["confirmed"]["white"]]
+    black = [tuple(p) for p in ctx["confirmed"]["black"]]
+    white = [tuple(p) for p in ctx["confirmed"]["white"]]
     q_svg = board_svg(cols, rows, black, white, caption="题目")
     # 正解图：正解首着 + PV 前 6 手
     from engine.katago import from_gtp
-    to_play = PROBLEM_TYPES[sess["ptype"]][0]
+    to_play = PROBLEM_TYPES[ptype][0]
     pl, sol_moves, sx, sy = to_play, [], None, None
     for i, m in enumerate(res["solution"]["pv"][:6]):
         if m == "pass":
@@ -140,13 +211,17 @@ def report(sid):
     sol_svg = board_svg(cols, rows, black, white, moves=sol_moves,
                         caption=f"正解：{res['solution']['move']}，{res['solution']['verdict']}")
     kid_svg = ""
-    if sess.get("kid_moves"):
-        km = [(m["seq"], m["color"], m["x"], m["y"]) for m in sess["kid_moves"]]
+    if ctx.get("kid_moves"):
+        km = [(m["seq"], m["color"], m["x"], m["y"]) for m in ctx["kid_moves"]]
         kid_svg = board_svg(cols, rows, black, white, moves=km,
                             caption=f"孩子的变化（结局：{res.get('kid_verdict') or '未录'}）")
-    return render_template("report.html", sess=sess, res=res,
+    view = {"sid": sid, "created": sess.get("created", ""),
+            "problem_id": ctx.get("problem_id"),
+            "board": (bi + 1) if sess.get("multi") and bi is not None else None,
+            "board_count": len(sess["boards"]) if sess.get("multi") else None}
+    return render_template("report.html", sess=view, res=res,
                            q_svg=q_svg, sol_svg=sol_svg, kid_svg=kid_svg,
-                           hints=hints_for(sess["ptype"]))
+                           hints=hints_for(ptype))
 
 
 if __name__ == "__main__":

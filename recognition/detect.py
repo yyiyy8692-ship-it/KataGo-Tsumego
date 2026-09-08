@@ -107,6 +107,66 @@ def _ring_dark_frac(gray, cx, cy, r, n=36):
     return float(np.mean([v < 150 for v in vals])) if vals else 0.0
 
 
+def _spacing_from_lines(gray):
+    """从印刷线位置直接估间距——棋盘最干净、最密集的证据。
+    棋子圆心先验在子少时会退化（实测一图多题切出的裁剪图只有 2 颗黑子，
+    prior 返回 None，回退到全体圆心后被幽灵圆带成半间距 21.5，网格翻倍）。
+    用 _detect_raw_lines（宽松参数，线段多）而非 _detect_lines（严格，
+    稀疏棋盘丢线太多会把间距估成 2 倍）。"""
+    segs = _detect_raw_lines(gray)
+
+    def est(vals):
+        if len(vals) < 3:
+            return None
+        c = _cluster(sorted(vals), 12)
+        if len(c) < 2:
+            return None
+        d = [b - a for a, b in zip(c, c[1:]) if 20 <= b - a <= 250]
+        if not d:
+            return None
+        med = float(np.median(d))
+        # 一致性：多数相邻差应接近中位数，否则不是规则网格
+        n_ok = sum(1 for x in d if abs(x - med) < 0.35 * med)
+        if n_ok < max(1, (len(d) + 1) // 2):
+            return None
+        return med
+
+    sx = est([(s[0] + s[2]) / 2 for s in segs if s[4] == "v"])
+    sy = est([(s[1] + s[3]) / 2 for s in segs if s[4] == "h"])
+    if sx and sy:
+        # 线缺失只会让估计偏大（跳过缺线），不会偏小——取小的
+        return min(sx, sy)
+    return sx or sy
+
+
+def _spacing_score(reps, s):
+    """候选间距 s 对线位置证据的拟合得分（供线估计与圆心先验冲突时仲裁）。
+    最佳相位下：匹配的线位置数 + 匹配的节点数 - 节点总数。
+    幽灵半间距会在真线之间造出一倍空节点被重罚；线缺失时 2s 会漏掉
+    一半真实线位置，命中数上不去。真间距两边都满分。"""
+    if len(reps) < 2:
+        return -1e9
+    lo, hi = reps[0], reps[-1]
+    tol = max(2.5, 0.2 * s)
+    best = -1e9
+    a = lo - s * 0.4
+    while a <= lo + s * 0.4:
+        nodes = []
+        x = a
+        while x <= hi + s * 0.25:
+            if x >= lo - s * 0.25:
+                nodes.append(x)
+            x += s
+        if nodes:
+            matched_nodes = sum(
+                1 for n in nodes if any(abs(r - n) < tol for r in reps))
+            matched_reps = sum(
+                1 for r in reps if any(abs(r - n) < tol for n in nodes))
+            best = max(best, matched_reps + matched_nodes - len(nodes))
+        a += 1.0
+    return best
+
+
 def _spacing_prior(centers):
     """圆心两两距离 -> 间距先验（细粒度整数倍得分）。
     不用直方图：44±2 的距离会被 bin 边界劈半，输给 62(=44√2 对角距)。
@@ -228,7 +288,23 @@ def detect_grid(gray):
                         max(int(cx) - 3, 0):int(cx) + 4].mean())
 
     blacks = [c for c in c1 if brightness(*c) < 110]
-    s0 = _spacing_prior(blacks) or _spacing_prior(c1)
+    # 间距决策：线位置估计优先（干净、不受棋子数量/蓝字影响），圆心先验兜底
+    # （线被大面积压断时）。两者冲突（一个是另一个约 2 倍——幽灵半间距 vs
+    # 线缺失 2s）时，用线位置证据打分仲裁（_spacing_score）。
+    s_line = _spacing_from_lines(gray)
+    s_circ = _spacing_prior(blacks) or _spacing_prior(c1)
+    s0 = None
+    if s_line and s_circ and max(s_line, s_circ) / min(s_line, s_circ) > 1.55:
+        segs = _detect_raw_lines(gray)
+        reps_x = _cluster(sorted((t[0] + t[2]) / 2 for t in segs if t[4] == "v"), 12)
+        reps_y = _cluster(sorted((t[1] + t[3]) / 2 for t in segs if t[4] == "h"), 12)
+        cands = {s_line: max(_spacing_score(reps_x, s_line),
+                             _spacing_score(reps_y, s_line)),
+                 s_circ: max(_spacing_score(reps_x, s_circ),
+                             _spacing_score(reps_y, s_circ))}
+        s0 = max(cands, key=cands.get)
+    else:
+        s0 = s_line or s_circ
     xs = ys = None
     if s0:
         xs = _fit_lattice(line_xs + [c[0] for c in c1], s0)
@@ -262,7 +338,7 @@ def grid_from_stones(centers):
     return (xs, ys) if len(xs) >= 2 and len(ys) >= 2 else None
 
 
-def _line_visibility(gray, cx, cy, r, edge_l, edge_r, edge_t, edge_b):
+def _line_visibility(gray, cx, cy, r, edge_l, edge_r, edge_t, edge_b, ignore=None):
     """网格线在该节点是否可见（印刷图"有子必盖线"）。返回 (横线占比, 竖线占比)。
 
     三个关键设计，全是踩坑换来的：
@@ -270,7 +346,10 @@ def _line_visibility(gray, cx, cy, r, edge_l, edge_r, edge_t, edge_b):
       实测达 6.5-9px），窄带采样会整条线漏掉（实测角点 cross_dark=4 vs 中部 34）
     - 边缘/角节点只采棋盘内侧半窗：边节点外侧本来就没有线，
       全窗采样会让暗像素天然减半，固定阈值必然把边缘空点误判成白子
-    - 按采样长度归一化成占比而非绝对像素数：间距 s 变化时绝对数不可比"""
+    - 按采样长度归一化成占比而非绝对像素数：间距 s 变化时绝对数不可比
+    - ignore（蓝字掩码）：蓝字像素从分子分母同时剔除。写"涂白"不行——
+      数字写在棋子上是正常用法，涂白会吃掉黑子中心；抗锯齿残边又会让
+      白子上的线显得可见"""
     h, w = gray.shape
     cx, cy, r = int(cx), int(cy), int(r)
     # 带宽 ±10px：透视下节点拟合偏差实测达 6.5-9px，窄带会整条线漏掉。
@@ -282,23 +361,51 @@ def _line_visibility(gray, cx, cy, r, edge_l, edge_r, edge_t, edge_b):
     if x1 <= x0:
         x0, x1 = max(cx - r, 0), min(cx + r, w - 1)
     rows = gray[max(cy - band, 0):cy + band + 1, x0:x1 + 1]
-    hf = float(np.mean((rows < 150).any(axis=0))) if rows.size else 0.0
+    ig = None
+    if ignore is not None:
+        ig = ignore[max(cy - band, 0):cy + band + 1, x0:x1 + 1] > 0
+    if rows.size == 0:
+        hf = 0.0
+    elif ig is not None:
+        darkp = (rows < 150) & (~ig)
+        validcol = (~ig).any(axis=0)
+        hf = float(darkp.any(axis=0)[validcol].mean()) if validcol.any() else 0.0
+    else:
+        hf = float(np.mean((rows < 150).any(axis=0)))
     y0 = cy if edge_t else max(cy - r, 0)
     y1 = cy if edge_b else min(cy + r, h - 1)
     if y1 <= y0:
         y0, y1 = max(cy - r, 0), min(cy + r, h - 1)
     cols = gray[y0:y1 + 1, max(cx - band, 0):cx + band + 1]
-    vf = float(np.mean((cols < 150).any(axis=1))) if cols.size else 0.0
+    if ignore is not None:
+        igv = ignore[y0:y1 + 1, max(cx - band, 0):cx + band + 1] > 0
+    else:
+        igv = None
+    if cols.size == 0:
+        vf = 0.0
+    elif igv is not None:
+        darkp = (cols < 150) & (~igv)
+        validrow = (~igv).any(axis=1)
+        vf = float(darkp.any(axis=1)[validrow].mean()) if validrow.any() else 0.0
+    else:
+        vf = float(np.mean((cols < 150).any(axis=1)))
     return hf, vf
 
 
-def classify_by_sweep(gray, xs, ys):
+def _ignore_mask(bgr):
+    """手写蓝字掩码（膨胀 2 轮盖住抗锯齿边缘），供棋子分类剔除用。"""
+    return cv2.dilate(_blue_mask(bgr), np.ones((3, 3), np.uint8), iterations=2)
+
+
+def classify_by_sweep(gray, xs, ys, ignore=None):
     """全交叉点扫描分类（印刷题图专用，比 HoughCircles 稳一个量级）：
     - 中心圆盘暗像素占比 >0.5 → 黑子（比单点亮度抗噪：空点中心压线也偏暗，
       实测空点中心亮度 116，距旧阈值 110 仅一线之隔，但圆盘占比仅 ~0.3）
     - 否则横竖任一线可见（占比 >0.4）→ 空点
     - 否则 → 白子（网格线被白子盖住了）
-    依据：印刷图里"有子必盖线"。真实木盘照片不适用（木纹/透视），勿挪用。"""
+    依据：印刷图里"有子必盖线"。真实木盘照片不适用（木纹/透视），勿挪用。
+    ignore：蓝字掩码。数字写在棋子上是正常用法（写在哪一手上），蓝字像素
+    从分子分母同时剔除——涂白会把黑子中心吃掉、残边让白子上的线假可见。"""
     dx = np.median(np.diff(xs)) if len(xs) > 1 else 20
     dy = np.median(np.diff(ys)) if len(ys) > 1 else 20
     r = int(min(dx, dy) * 0.35)
@@ -307,16 +414,30 @@ def classify_by_sweep(gray, xs, ys):
     for ix, x in enumerate(xs):
         for iy, y in enumerate(ys):
             cx, cy = int(x), int(y)
-            rd = max(r // 2, 3)
-            disc = gray[max(cy - rd, 0):cy + rd + 1, max(cx - rd, 0):cx + rd + 1]
-            dark_frac = float(np.mean(disc < 110)) if disc.size else 0.0
+            # 采样盘半径 0.38s：接近石子真实半径(0.44s)但不碰邻子(s 间距)。
+            # 不能太小——数字写在棋子上是正常用法，小盘会被数字整个盖住
+            # （分母不足，实测 15px 盘被字宽 22px 的"1"全覆盖）；也不能
+            # ≥0.42s，会蹭到邻子边缘。空点的线占比随盘增大反而降低。
+            rd = max(int(min(dx, dy) * 0.38), 5)
+            sy0, sy1 = max(cy - rd, 0), cy + rd + 1
+            sx0, sx1 = max(cx - rd, 0), cx + rd + 1
+            disc = gray[sy0:sy1, sx0:sx1]
+            if ignore is not None:
+                ig = ignore[sy0:sy1, sx0:sx1] > 0
+                valid = ~ig
+                denom = int(valid.sum())
+                # 分母太小（数字完全盖住采样盘）时保守判空，交给步骤②门禁
+                dark_frac = (float((disc < 110) [valid].sum()) / denom
+                             if denom >= 9 else 0.0)
+            else:
+                dark_frac = float(np.mean(disc < 110)) if disc.size else 0.0
             if dark_frac > 0.5:
                 black.add((ix, iy))
                 marks.append((cx, cy, r, "B"))
                 continue
             hf, vf = _line_visibility(gray, cx, cy, r,
                                       ix == 0, ix == nx - 1,
-                                      iy == 0, iy == ny - 1)
+                                      iy == 0, iy == ny - 1, ignore=ignore)
             if max(hf, vf) > 0.4:
                 pass  # 空点
             else:
@@ -614,10 +735,12 @@ def _extend_grid_edges(gray, xs, ys):
 
 def _merge_digits(*digit_lists):
     """多源数字识别结果按交叉点取优。
-    规则（实测标定）：有读数永远优先于 "?"，同级才按 conf——
-    因为 "?" 的 conf 是双门槛拦截前的原始分，可能比正确答案的 conf 还高，
-    纯按 conf 会让 "?" 把读对的答案挤掉（实测 6% 透视融合后 40/60 < 单源 48/60）。
-    warp 后图（透视已矫正）与原图（无插值模糊）各有优势场景，融合取两者长处。"""
+    规则（两轮实测标定）：**纯按 conf 比较，平票才有读数者优先**——
+    "?" 的 conf 是双门槛拦截前的原始分，可能比正确答案还高（透视下
+    2→1 的 conf 高达 0.70 但 top2 并列），此时宁可 "?"；反过来 warp 源
+    插值模糊产生的低分误读（实测 "2"→"9" conf 0.53）也不该压过原图源
+    拦截前 0.62 的判据。误读比 "?" 严重得多：? 走人工确认，错读会
+    直接进批改。"""
     best = {}
     for lst in digit_lists:
         for d in lst:
@@ -625,28 +748,35 @@ def _merge_digits(*digit_lists):
             cur = best.get(key)
             if cur is None:
                 best[key] = d
-            elif d[0] is not None and cur[0] is None:
-                best[key] = d
-            elif d[0] is None and cur[0] is not None:
-                pass
             elif d[3] > cur[3]:
+                best[key] = d
+            elif d[3] == cur[3] and cur[0] is None and d[0] is not None:
                 best[key] = d
     return sorted(best.values(), key=lambda t: (t[0] is None, t[0] or 99))
 
 
 def _digit_templates():
-    """cv2 渲染 1-9 模板（多字号多粗细），懒加载。
-    手写体与印刷体差异大，识别率低是预期——低置信一律标 ? 走人工确认。"""
+    """cv2 渲染 1-9 模板（多字体多粗细），懒加载。
+    手写体与印刷体差异大，识别率低是预期——低置信一律标 ? 走人工确认。
+    "1" 额外配纯竖杠模板：孩子手写的 1 常是一竖，衬线体 1 反而匹配不上；
+    蓝字画在黑子上时模糊晕圈会把字撑胖（晕圈混黑底仍是蓝），竖杠+开运算
+    瘦身双管齐下。"""
     global _DIGIT_TEMPLATES
     if _DIGIT_TEMPLATES is None:
         _DIGIT_TEMPLATES = {}
         for d in range(1, 10):
             variants = []
-            for scale, thick in ((0.9, 2), (1.1, 2), (1.0, 3)):
+            for font, scale, thick in ((cv2.FONT_HERSHEY_SIMPLEX, 0.9, 2),
+                                       (cv2.FONT_HERSHEY_SIMPLEX, 1.1, 2),
+                                       (cv2.FONT_HERSHEY_SIMPLEX, 1.0, 3),
+                                       (cv2.FONT_HERSHEY_TRIPLEX, 1.0, 2)):
                 img = np.zeros((36, 36), np.uint8)
-                cv2.putText(img, str(d), (6, 28), cv2.FONT_HERSHEY_SIMPLEX,
-                            scale, 255, thick)
+                cv2.putText(img, str(d), (6, 28), font, scale, 255, thick)
                 variants.append(img)
+            if d == 1:
+                bar = np.zeros((36, 36), np.uint8)
+                bar[6:30, 15:21] = 255
+                variants.append(bar)
             _DIGIT_TEMPLATES[d] = variants
     return _DIGIT_TEMPLATES
 
@@ -659,6 +789,9 @@ def _classify_digit(patch):
     宁标 "?" 走人工，不冤枉孩子。"""
     if patch.size == 0 or patch.sum() == 0:
         return None, 0.0
+    # 注意：不要在这里做形态学开运算瘦身。蓝字画在黑子上确实会被晕圈撑胖，
+    # 但开运算会把白底上的细笔画（干净的 2、7）一起削坏（实测 "2" 的
+    # conf 从 0.64 掉到 0.44）。胖块的歧义交给双门槛标 "?" 更安全。
     h, w = patch.shape
     side = max(h, w) + 8
     sq = np.zeros((side, side), np.uint8)
@@ -717,7 +850,8 @@ def recognize(photo_path):
         gray_cls[_blue_mask(wb) > 0] = 255
         bgr = wb
 
-    black, white, marks = classify_by_sweep(gray_cls, xs, ys)
+    black, white, marks = classify_by_sweep(gray_cls, xs, ys,
+                                            ignore=_ignore_mask(bgr))
     if quad is not None:
         digits = _merge_digits(detect_blue_digits(orig_bgr, orig_xs, orig_ys),
                                detect_blue_digits(bgr, xs, ys))
@@ -743,3 +877,95 @@ def recognize(photo_path):
         "digits": digits,
         "overlay": overlay_path,
     }
+
+
+def split_boards(photo_path):
+    """一图多题切分（印刷题图专用）。返回裁剪图的路径列表，单棋盘时长度为 1。
+
+    GitHub 多棋盘识别项目（kaya-go/moku、tsoj/Chess_diagram_to_FEN 等）的共识
+    架构是「先切分出每个棋盘区域 → 每个区域独立走单盘管线」。切分用深度学习
+    目标检测太重且 moku 是 AGPL 协议（会传染公开仓库），印刷题图用传统 CV 即可：
+    HoughLinesP 检所有线段 → 线段包围盒按空间邻接做并查集聚类——同一棋盘的
+    横竖线互相交叉接触必然连通，题与题之间的空白天然断开 → 过滤噪声簇
+    （横竖线各不足 2 条、或包围盒太小的丢掉）→ 阅读顺序排序 → 加边裁剪。
+
+    局限：两个棋盘贴得比邻接阈值还近时会并成一簇（此时整簇走单盘管线，
+    步骤②画回确认门禁兜底）；面向真实木盘/复杂背景不适用（同 classify_by_sweep）。
+    """
+    bgr = cv2.imread(photo_path)
+    if bgr is None:
+        raise ValueError("照片读取失败")
+    h, w = bgr.shape[:2]
+    if max(h, w) > 1600:
+        s = 1600 / max(h, w)
+        bgr = cv2.resize(bgr, (int(w * s), int(h * s)))
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray[_blue_mask(bgr) > 0] = 255  # 手写蓝字会截断线段，先洗掉
+
+    segs = _detect_raw_lines(gray)
+    if len(segs) < 4:
+        return [photo_path]
+
+    n = len(segs)
+    parent = list(range(n))
+
+    def find(a):
+        while parent[a] != a:
+            parent[a] = parent[parent[a]]
+            a = parent[a]
+        return a
+
+    def union(a, b):
+        ra, rb = find(a), find(b)
+        if ra != rb:
+            parent[ra] = rb
+
+    boxes = [(min(s[0], s[2]), min(s[1], s[3]),
+              max(s[0], s[2]), max(s[1], s[3])) for s in segs]
+    # 邻接阈值：图片短边的 1%（下限 8px）。棋盘内部横竖线互相交叉，远小于此；
+    # 印刷题册题间距通常 ≥ 2 个格宽，远大于此。
+    thr = max(8, min(bgr.shape[:2]) // 100)
+    for i in range(n):
+        bi = boxes[i]
+        for j in range(i + 1, n):
+            bj = boxes[j]
+            if not (bi[2] + thr < bj[0] or bj[2] + thr < bi[0]
+                    or bi[3] + thr < bj[1] or bj[3] + thr < bi[1]):
+                union(i, j)
+
+    groups = {}
+    for i in range(n):
+        groups.setdefault(find(i), []).append(i)
+
+    clusters = []
+    for idxs in groups.values():
+        hs = sum(1 for i in idxs if segs[i][4] == "h")
+        vs = sum(1 for i in idxs if segs[i][4] == "v")
+        x1 = min(boxes[i][0] for i in idxs)
+        y1 = min(boxes[i][1] for i in idxs)
+        x2 = max(boxes[i][2] for i in idxs)
+        y2 = max(boxes[i][3] for i in idxs)
+        # 噪声过滤：真棋盘横竖线各 ≥2 条且尺寸像块棋盘
+        if hs >= 2 and vs >= 2 and (x2 - x1) >= 60 and (y2 - y1) >= 60:
+            clusters.append((x1, y1, x2, y2))
+    if len(clusters) <= 1:
+        return [photo_path]
+
+    # 阅读顺序：先按行带（纵坐标分组）再按横坐标
+    med_h = sorted(c[3] - c[1] for c in clusters)[len(clusters) // 2]
+    band = max(med_h, 1) * 1.2
+    clusters.sort(key=lambda c: (int(c[1] + (c[3] - c[1]) / 2) // band,
+                                 c[0] + (c[2] - c[0]) / 2))
+
+    stem = photo_path.rsplit(".", 1)[0]
+    ext = photo_path.rsplit(".", 1)[1] if "." in photo_path else "jpg"
+    pad = 14  # 加边：给四角精化留点余量
+    ih, iw = bgr.shape[:2]
+    out = []
+    for i, (x1, y1, x2, y2) in enumerate(clusters):
+        crop = bgr[max(int(y1) - pad, 0):min(int(y2) + pad, ih),
+                   max(int(x1) - pad, 0):min(int(x2) + pad, iw)]
+        p = f"{stem}_b{i}.{ext}"
+        cv2.imwrite(p, crop)
+        out.append(p)
+    return out

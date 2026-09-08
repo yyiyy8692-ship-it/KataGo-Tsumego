@@ -21,7 +21,7 @@
 </style>
 </head>
 <body>
-<h1>讲题卡 · {{ res.type_desc }}</h1>
+<h1>讲题卡 · {{ res.type_desc }}{% if sess.board %}（第 {{ sess.board }} / {{ sess.board_count }} 题）{% endif %}</h1>
 <p style="font-size:13px;color:#777">批改时间：{{ sess.get("created","") }}　结论：<b>{{ res.solution.verdict }}</b>
 {% if sess.get("problem_id") %}　已入题库：<b>{{ sess.problem_id }}</b>{% endif %}</p>
 
