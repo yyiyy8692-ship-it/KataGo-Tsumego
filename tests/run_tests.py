@@ -24,11 +24,24 @@ def check(name, cond, detail=""):
 def gen_fixtures():
     from make_synthetic import make_photo
     import cv2, numpy as np
+    np.random.seed(42)  # 夹具噪声固定，避免偶发抖动造成假失败
     make_photo(7, 5, black=[(1,1),(2,1),(3,1),(1,3),(2,3)],
                white=[(1,2),(2,2),(3,2),(4,2),(3,3)],
                digits=[(1,3,0),(2,4,1),(3,2,0)], out="/tmp/t_p1.jpg", rot=2.0)
     make_photo(5, 5, black=[(1,1),(2,1),(3,1)], white=[(1,2),(2,2),(3,2),(2,3)],
                digits=[], out="/tmp/t_small.jpg", rot=-3.0)
+    # 线穿白子印刷风格 + 6° 侧拍梯形畸变（横线水平竖线斜）
+    # ——2026-09-08 真实书页照片踩出的两个坑，固化成回归
+    make_photo(7, 9, black=[(4,6),(4,7),(5,4),(5,5)],
+               white=[(4,2),(5,3),(4,4),(4,5),(3,6),(1,7),(3,7)],
+               digits=[], out="/tmp/t_linethrough.jpg", rot=0,
+               line_through=True)
+    img = cv2.imread("/tmp/t_linethrough.jpg")
+    hh, ww = img.shape[:2]
+    M = np.float32([[1, np.tan(np.radians(6.0)), 0], [0, 1, 0]])
+    img = cv2.warpAffine(img, M, (int(ww + hh * np.tan(np.radians(6.0))), hh),
+                         borderValue=(245, 242, 235))
+    cv2.imwrite("/tmp/t_linethrough.jpg", img)
     img = cv2.imread("/tmp/t_p1.jpg")
     h, w = img.shape[:2]
     k = 0.06
@@ -68,6 +81,14 @@ def test_recognition():
     # 宁缺毋错：透视剪切的 2 允许标 ? 或读对（2），绝不允许误读（曾误读成 1）
     check("识别-透视-误读宁缺毋错", seqs.get((4,1)) in (None, 2), f"2被读成{seqs.get((4,1))}")
     check("识别-透视-其余编号", seqs.get((3,0))==1 and seqs.get((2,0))==3, str(r["digits"]))
+
+    # 线穿白子 + 梯形畸变：真实书页场景回归（白子描边空心、线从子身穿过的
+    # 印刷风格曾让白子全灭；6° 竖线倾斜曾让间距估计崩溃）
+    r = recognize("/tmp/t_linethrough.jpg")
+    check("识别-线穿白子梯形-棋子",
+          set(map(tuple,r["black"]))=={(4,6),(4,7),(5,4),(5,5)}
+          and set(map(tuple,r["white"]))=={(4,2),(5,3),(4,4),(4,5),(3,6),(1,7),(3,7)},
+          f"B={r['black']} W={r['white']} grid={r['cols']}x{r['rows']}")
 
     try:
         recognize("/tmp/synth_blank.jpg")
