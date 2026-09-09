@@ -32,10 +32,13 @@ def gen_fixtures():
                digits=[], out="/tmp/t_small.jpg", rot=-3.0)
     # 线穿白子印刷风格 + 6° 侧拍梯形畸变（横线水平竖线斜）
     # ——2026-09-08 真实书页照片踩出的两个坑，固化成回归
+    # cell=100 而非默认 44：真实书页照片的格距约 116px，用 44 会把白子核心
+    # 采样窗（0.128s）压在穿过白子的网格线上、核心变暗，白子判据全灭——
+    # 那是夹具的尺度失真，不是识别的问题（2026-09-09）。
     make_photo(7, 9, black=[(4,6),(4,7),(5,4),(5,5)],
                white=[(4,2),(5,3),(4,4),(4,5),(3,6),(1,7),(3,7)],
                digits=[], out="/tmp/t_linethrough.jpg", rot=0,
-               line_through=True)
+               line_through=True, cell=100)
     img = cv2.imread("/tmp/t_linethrough.jpg")
     hh, ww = img.shape[:2]
     M = np.float32([[1, np.tan(np.radians(6.0)), 0], [0, 1, 0]])
@@ -65,9 +68,13 @@ def test_recognition():
     eb = {(1,1),(2,1),(3,1),(1,3),(2,3)}
     ew = {(1,2),(2,2),(3,2),(4,2),(3,3)}
 
+    # 手写数字识别 2026-09-08 起退休（用户判定无实际价值：铅笔读不出、
+    # 圆珠笔读数仍要人复核，省不掉人工却多一个误判来源）。代码保留在
+    # detect_blue_digits 供回滚，但测试不再为它把门——实测它现在会误读
+    # （合成图上把 1/3 读成 2、把 2 读成 7），继续断言只会锁死一个死功能。
     r = recognize("/tmp/t_p1.jpg")
     check("识别-旋转2°-棋子", set(map(tuple,r["black"]))==eb and set(map(tuple,r["white"]))==ew)
-    check("识别-旋转2°-编号", [d[0] for d in r["digits"]]==[1,2,3], str(r["digits"]))
+    check("识别-默认不读编号", r["digits"] == [])
 
     r = recognize("/tmp/t_small.jpg")
     check("识别-小棋盘5x5-棋子", set(map(tuple,r["black"]))=={(1,1),(2,1),(3,1)}
@@ -77,10 +84,7 @@ def test_recognition():
     r = recognize("/tmp/t_persp.jpg")
     check("识别-透视-棋子", set(map(tuple,r["black"]))==eb and set(map(tuple,r["white"]))==ew,
           f"B={r['black']} W={r['white']}")
-    seqs = {(d[1],d[2]): d[0] for d in r["digits"]}
-    # 宁缺毋错：透视剪切的 2 允许标 ? 或读对（2），绝不允许误读（曾误读成 1）
-    check("识别-透视-误读宁缺毋错", seqs.get((4,1)) in (None, 2), f"2被读成{seqs.get((4,1))}")
-    check("识别-透视-其余编号", seqs.get((3,0))==1 and seqs.get((2,0))==3, str(r["digits"]))
+    check("识别-透视-不读编号", r["digits"] == [])
 
     # 线穿白子 + 梯形畸变：真实书页场景回归（白子描边空心、线从子身穿过的
     # 印刷风格曾让白子全灭；6° 竖线倾斜曾让间距估计崩溃）

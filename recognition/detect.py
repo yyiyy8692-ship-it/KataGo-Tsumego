@@ -254,6 +254,50 @@ def _fit_lattice(vals, s):
     return grid if len(grid) >= 2 else None
 
 
+def _fit_lattice2(phase_vals, range_vals, s):
+    """相位/范围分离的点阵拟合（_fit_lattice 的抗幽灵版）。
+
+    模糊低对比照片上白子幽灵圆成群且相位一致（摞子边缘弧，-0.47s），
+    实测投票精检 46 颗中 29 颗幽灵、真白子仅 10 颗——幽灵占多数时
+    _fit_lattice 按命中数扫相位会被"多数暴政"带歪半格。
+    黑子圆心过 <110 亮度验证几乎零幽灵，故相位只信黑子圆心+印刷线；
+    网格范围与节点精化仍用全部证据（含白子圆心，补无黑子的行/列）。
+    相位证据不足 2 个时退回全体证据（等效旧 _fit_lattice）。"""
+    if len(phase_vals) < 2:
+        phase_vals = range_vals
+    if len(range_vals) < 2 or s < 8:
+        return None
+    phase_vals = sorted(phase_vals)
+    range_vals = sorted(range_vals)
+    best_a, best_hits = None, -1
+    lo_p = phase_vals[0]
+    a = lo_p - s * 0.4
+    while a <= lo_p + s * 0.4:
+        hits = 0
+        for v in phase_vals:
+            r = (v - a) % s
+            if r < s * 0.22 or r > s * 0.78:
+                hits += 1
+        if hits > best_hits:
+            best_a, best_hits = a, hits
+        a += 0.5
+    if best_hits < 2:
+        return None
+    lo, hi = range_vals[0], range_vals[-1]
+    grid = []
+    k = int(np.floor((lo - best_a) / s))
+    while best_a + k * s <= hi + s * 0.4:
+        node = best_a + k * s
+        if lo - s * 0.3 <= node <= hi + s * 0.3:
+            # 节点精化只用相位证据（线+黑子圆心）：白子幽灵圆成片落在
+            # 真节点 -0.3s 处（恰在 0.25s 精化窗内），参与取均值会把节点
+            # 拉偏 20-30px，扫描分类在空点上踩到子缘/笔迹出幻影白子
+            near = [v for v in phase_vals if abs(v - node) < s * 0.25]
+            grid.append(float(np.mean(near)) if near else node)
+        k += 1
+    return grid if len(grid) >= 2 else None
+
+
 def _cross_dark(gray, cx, cy, r):
     """过圆心的横竖两条线上暗像素数。
     真白子的中心十字被子体盖住 ≈0；空交叉点幻影有网格线十字穿过 ≥10。"""
@@ -318,6 +362,13 @@ def _cluster_gapfill(line_pos, s):
     for a, b in zip(c, c[1:]):
         gap = b - a
         k = int(round(gap / s))
+        if k < 2 and abs(gap - s) >= 0.4 * s:
+            # 相邻簇间距既不是 ~s 也不是 s 的整数倍：线证据被污染。
+            # 实测模糊低对比照片上，同列摞子的左缘切线连成"幽灵竖线"，
+            # 位置在真线 -0.47s 处，与真线差 0.57s 被当成相邻线，
+            # 整盘相位错半格、扫描分类全崩（全判白）。结构不可信，
+            # 返回 None 走圆心证据回退路径，不硬猜。
+            return None
         if k >= 2:
             if k > 4 or abs(gap / k - s) >= 0.3 * s:
                 return None
@@ -325,6 +376,28 @@ def _cluster_gapfill(line_pos, s):
                 out.append(a + gap * i / k)
         out.append(b)
     return out if len(out) >= 3 else None
+
+
+def _grid_hits_circles(xs, ys, circles, min_frac=0.6):
+    """网格与圆心证据一致性校验：圆心落在节点 0.28s 内的占比。
+
+    线证据被幽灵线整体带偏半格时（摞子边缘切线间距恰好也 ≈s，
+    _cluster_gapfill 的结构校验拦不住），圆心是唯一独立证据。
+    粗检圆（param2=28 严参数）里幽灵占比低，真子必然压节点。
+    圆太少（<3）无法裁决时放行，交给后续画回确认门禁。"""
+    if len(circles) < 3:
+        return True
+    sx = float(np.median(np.diff(xs))) if len(xs) > 1 else 1e9
+    sy = float(np.median(np.diff(ys))) if len(ys) > 1 else 1e9
+    if sx < 8 or sy < 8:
+        return True
+    hits = 0
+    for cx, cy in circles:
+        dx = min(abs(cx - x) for x in xs)
+        dy = min(abs(cy - y) for y in ys)
+        if dx < 0.28 * sx and dy < 0.28 * sy:
+            hits += 1
+    return hits / len(circles) >= min_frac
 
 
 def detect_grid(gray):
@@ -363,30 +436,53 @@ def detect_grid(gray):
         # 主路径：纯线证据聚类+插值（免疫透视渐变与幽灵圆）
         xs = _cluster_gapfill(line_xs, s0)
         ys = _cluster_gapfill(line_ys, s0)
+        if xs and ys:
+            # 线网格一致性校验只用黑子圆心（<110 亮度验证，几乎零幽灵）：
+            # 粗检圆里白子幽灵成群（实测 37 颗里 26 颗幽灵），用全体圆心
+            # 会把正确网格误判成不一致（真子 11/37=0.30 < 0.6 阈值）
+            if not _grid_hits_circles(xs, ys, blacks):
+                # 线网格与黑子证据矛盾（幽灵线整体半格偏移），信圆心，走回退
+                xs = ys = None
     if not xs or not ys:
         # 回退路径：线太少时靠圆心证据的点阵/融合拟合（勿动，老路兜底）
         xs = ys = None
+        c2 = []
+        if s0 and s0 >= 8:
+            # 模糊/低对比照片上粗检圆幽灵成群（实测一张 194 颗、真子仅 17），
+            # 粗圆心直接进点阵拟合会把相位带歪半格；先投票精检提纯再拟合。
+            # 提纯不足 4 颗时退回粗圆心（裁剪小子图常见），宁滥勿缺。
+            c2 = _consensus_circles(gray, s0)
+        ev = c2 if len(c2) >= 4 else c1
+        ev_black = [c for c in ev if brightness(*c) < 110]
         if s0:
-            xs = _fit_lattice(line_xs + [c[0] for c in c1], s0)
-            ys = _fit_lattice(line_ys + [c[1] for c in c1], s0)
+            xs = _fit_lattice2(line_xs + [c[0] for c in ev_black],
+                               line_xs + [c[0] for c in ev], s0)
+            ys = _fit_lattice2(line_ys + [c[1] for c in ev_black],
+                               line_ys + [c[1] for c in ev], s0)
         if not xs or not ys:
-            xs = _fuse(line_xs, [c[0] for c in c1])
-            ys = _fuse(line_ys, [c[1] for c in c1])
+            xs = _fuse(line_xs, [c[0] for c in ev])
+            ys = _fuse(line_ys, [c[1] for c in ev])
         if not xs or not ys:
             return None
         s = min(np.median(np.diff(xs)) if len(xs) > 1 else 1e9,
                 np.median(np.diff(ys)) if len(ys) > 1 else 1e9)
         if s == 1e9 or s < 8:
             return xs, ys, c1
-        c2 = _consensus_circles(gray, s)
+        if not c2:
+            c2 = _consensus_circles(gray, s)
         if c2:
-            # 精检圆心 + 线联合证据再拟合：补被棋子压断的线
-            xs2 = _fit_lattice(line_xs + [c[0] for c in c2], s)
-            ys2 = _fit_lattice(line_ys + [c[1] for c in c2], s)
-            if xs2 and len(xs2) >= len(xs):
-                xs = xs2
-            if ys2 and len(ys2) >= len(ys):
-                ys = ys2
+            # 精检圆心 + 线联合证据再拟合：补被棋子压断的线。
+            # 同样走相位/范围分离（防幽灵多数暴政），且须过黑子一致性校验
+            c2b = [c for c in c2 if brightness(*c) < 110]
+            xs2 = _fit_lattice2(line_xs + [c[0] for c in c2b],
+                                line_xs + [c[0] for c in c2], s)
+            ys2 = _fit_lattice2(line_ys + [c[1] for c in c2b],
+                                line_ys + [c[1] for c in c2], s)
+            if xs2 and ys2 and _grid_hits_circles(xs2, ys2, c2b):
+                if len(xs2) >= len(xs):
+                    xs = xs2
+                if len(ys2) >= len(ys):
+                    ys = ys2
             return xs, ys, c2
     return xs, ys, c1
 
@@ -396,6 +492,87 @@ def grid_from_stones(centers):
     xs = _cluster([c[0] for c in centers], 12)
     ys = _cluster([c[1] for c in centers], 12)
     return (xs, ys) if len(xs) >= 2 and len(ys) >= 2 else None
+
+
+def _snap_grid_to_lines(gray, xs, ys, circles):
+    """网格线吸附：把每根网格线精化到暗像素投影峰（±0.2s 搜索窗）。
+
+    圆心锚定的点阵有系统性偏移：锚点是石子中心（边线处的子半悬在外，
+    中心偏出线外 7px 实测），s 估计差 0.6% 累积到远端共 -15~-29px。
+    偏差 >10px 时扫描分类的 ±10px 采样带套不住真线，邻子描边环进带
+    被当成"线可见"，边点白子误判成空点（实测 3 处全因此）。
+    对每根线在 ±0.2s 内找暗像素覆盖率最高的位置；石子邻域（覆盖线段的
+    部分）从统计中剔除，避免子体把峰拉向自己。证据不足（<0.15）保持原位。
+    """
+    h, w = gray.shape
+    dark = (gray < 150).astype(np.uint8)
+
+    def stone_free_mask(length, positions, s):
+        """positions: 该方向上的石子中心坐标；返回可统计位置的布尔数组。"""
+        ok = np.ones(length, dtype=bool)
+        for p in positions:
+            lo = max(int(p - s * 0.5), 0)
+            hi = min(int(p + s * 0.5), length)
+            ok[lo:hi] = False
+        return ok
+
+    def snap(pos, orient, lo, hi, stones, s):
+        band = int(s * 0.2)
+        half = max(int(s * 0.02), 2)  # 线厚 ±2px
+
+        def coverage(cand):
+            if orient == "h":
+                y0, y1 = max(cand - half, 0), min(cand + half + 1, h)
+                strip = dark[y0:y1, max(int(lo), 0):min(int(hi), w)]
+                if strip.size == 0:
+                    return None
+                cov_line = strip.any(axis=0)
+            else:
+                x0, x1 = max(cand - half, 0), min(cand + half + 1, w)
+                strip = dark[max(int(lo), 0):min(int(hi), h), x0:x1]
+                if strip.size == 0:
+                    return None
+                cov_line = strip.any(axis=1)
+            free = stone_free_mask(len(cov_line), stones, s)
+            if free.sum() < 8:
+                return None
+            return float(cov_line[free].mean())
+
+        best_pos, best_cov = None, 0.0
+        for cand in range(int(pos) - band, int(pos) + band + 1, 2):
+            cov = coverage(cand)
+            if cov is not None and cov > best_cov:
+                best_cov, best_pos = cov, float(cand)
+        # 只在显著优于原位时才移动（+0.12）：原位证据已经不错时，
+        # 邻子/笔迹造成的次峰不值得追（实测密子区会把线吸附到子行上）
+        cur_cov = coverage(int(pos)) or 0.0
+        if best_pos is not None and best_cov > max(0.15, cur_cov + 0.12):
+            return best_pos
+        return pos
+
+    sx = float(np.median(np.diff(xs))) if len(xs) > 1 else 20
+    sy = float(np.median(np.diff(ys))) if len(ys) > 1 else 20
+    # 每根线只剔除压在该线上的石子邻域（|石坐标-线位|<0.5s），
+    # 方向别搞反：竖线的覆盖统计沿 y 走，剔除的是石子的 y 坐标
+    xs2 = [snap(x, "v", ys[0], ys[-1],
+                [c[1] for c in circles if abs(c[0] - x) < sx * 0.5], sx)
+           for x in xs]
+    ys2 = [snap(y, "h", xs2[0], xs2[-1],
+                [c[0] for c in circles if abs(c[1] - y) < sy * 0.5], sy)
+           for y in ys]
+
+    def uniform(vals, s):
+        """吸附后间距仍须大致均匀：任何间距 <0.6 或 >1.5 倍中位数即失败。"""
+        d = np.diff(vals)
+        m = float(np.median(d))
+        return bool(np.all(d > 0.6 * m) and np.all(d < 1.5 * m))
+
+    # 均匀性校验：吸附把网格拉散（密子区次峰）就整轴回退，宁要粗网格
+    if len(xs2) > 2 and not uniform(xs2, sx):
+        xs2 = list(xs)
+    if len(ys2) > 2 and not uniform(ys2, sy):
+        ys2 = list(ys)
+    return xs2, ys2
 
 
 def _line_visibility(gray, cx, cy, r, edge_l, edge_r, edge_t, edge_b, ignore=None):
@@ -457,6 +634,55 @@ def _ignore_mask(bgr):
     return cv2.dilate(_blue_mask(bgr), np.ones((3, 3), np.uint8), iterations=2)
 
 
+def _big_dark_frac(gray, cx, cy, half):
+    """交点窗口内「含中心的暗连通域」面积占比（黑子专属特征）。
+
+    黑子 = 0.44s 的实心大暗盘（占比 0.63~0.85）；网格线交叉/墙面线是细长条、
+    印刷小暗斑只有 20~30px，占比 <=0.45；空点 <=0.3。
+    为什么不用 dark_frac（盘内暗像素比）：底行交点压在 14px 粗墙线上时
+    dark_frac 可达 0.51 被误判黑子，而墙线细长的连通域占比只有 0.45。
+    """
+    H, W = gray.shape
+    x0, x1 = max(cx - half, 0), min(cx + half + 1, W)
+    y0, y1 = max(cy - half, 0), min(cy + half + 1, H)
+    win = gray[y0:y1, x0:x1] < 110
+    if not win.any():
+        return 0.0
+    n, lab = cv2.connectedComponents(win.astype(np.uint8), connectivity=8)
+    lid = lab[cy - y0, cx - x0] if (0 <= cy - y0 < lab.shape[0]
+                                    and 0 <= cx - x0 < lab.shape[1]) else 0
+    if lid:
+        return float((lab == lid).sum()) / win.size
+    sizes = [(lab == i).sum() for i in range(1, n)]
+    return (max(sizes) / win.size) if sizes else 0.0
+
+
+def _core_bright(gray, cx, cy, s):
+    """白子内部亮度：取半径 0.16s~0.34s 环带的中位，并剔除四个轴向 ±22° 扇区。
+
+    为什么不直接用中心小窗：题册是「线穿白子」印刷，网格线正好从子心穿过，
+    中心窗会整片压在线上，实测真白子 core-med 掉到 -17~-19（warp 后格距恒为
+    44，中心窗只有 7x7），比空点还暗，白子判据被自己的线判死。
+    环带 + 剔轴向后取到的才是真正的纸色核心。
+    """
+    h, w = gray.shape
+    r_in, r_out = 0.16 * s, 0.34 * s
+    n = int(r_out) + 1
+    xs_, ys_, vs = [], [], []
+    for dy in range(-n, n + 1):
+        for dx in range(-n, n + 1):
+            r = (dx * dx + dy * dy) ** 0.5
+            if not (r_in <= r <= r_out):
+                continue
+            deg = math.degrees(math.atan2(abs(dy), abs(dx)))   # 0=水平 90=垂直
+            if deg < 22 or deg > 68:      # 剔除横竖线穿过的四个扇区
+                continue
+            x, y = cx + dx, cy + dy
+            if 0 <= x < w and 0 <= y < h:
+                vs.append(gray[y, x])
+    return float(np.median(vs)) if vs else float(gray[cy, cx])
+
+
 def classify_by_sweep(gray, xs, ys, ignore=None):
     """全交叉点扫描分类（印刷题图专用，比 HoughCircles 稳一个量级）：
     - 中心圆盘暗像素占比 >0.5 → 黑子（比单点亮度抗噪：空点中心压线也偏暗，
@@ -468,6 +694,7 @@ def classify_by_sweep(gray, xs, ys, ignore=None):
     从分子分母同时剔除——涂白会把黑子中心吃掉、残边让白子上的线假可见。"""
     dx = np.median(np.diff(xs)) if len(xs) > 1 else 20
     dy = np.median(np.diff(ys)) if len(ys) > 1 else 20
+    med = float(np.median(gray))   # 纸面参考亮度（白子核心应接近此值）
     r = int(min(dx, dy) * 0.35)
     nx, ny = len(xs), len(ys)
     black, white, marks = set(), set(), []
@@ -491,7 +718,11 @@ def classify_by_sweep(gray, xs, ys, ignore=None):
                              if denom >= 9 else 0.0)
             else:
                 dark_frac = float(np.mean(disc < 110)) if disc.size else 0.0
-            if dark_frac > 0.5:
+            if dark_frac > 0.5 and _big_dark_frac(
+                    gray, cx, cy, max(int(min(dx, dy) * 0.44), 6)) > 0.5:
+                # 双条件：盘内暗占比高 **且** 暗的是一个大连通域。
+                # 只用 dark_frac 会在底行/边行误判：交点压着 14px 粗墙线时
+                # dark_frac 可到 0.51，但那是细长条不是黑子（2026-09-09 q4）
                 black.add((ix, iy))
                 marks.append((cx, cy, r, "B"))
                 continue
@@ -509,7 +740,27 @@ def classify_by_sweep(gray, xs, ys, ignore=None):
                 # 明显盖住（真白子 min(hf,vf) 0.29-0.39，粗线/阴影误报是 1.0）
                 ring = _ring_outline_frac(gray, cx, cy,
                                           max(int(min(dx, dy) * 0.44), 6))
-                if ring > 0.25 or (ring > 0.14 and min(hf, vf) < 0.95):
+                # 白子判据：描边环 + 亮核心（本册是「线穿白子」印刷风格，
+                # 实测大多数真白子 hf/vf=1.0，"盖线"条件会漏掉全部白子）。
+                # ③ 核心亮度 >= 纸面中位-15：白子=纸色+描边，核心亮；
+                #    假 ring 的暗斑/阴影核心是暗的。必须用小中心窗，
+                #    不能用 0.38s 采样盘中位——盘内纸面占多数，中位永远是纸面亮度。
+                # 主判据仍用中心小窗：实测它对真实照片最稳（q4 只残留 1 颗幻影；
+                # 全程改用环带采样会让铅笔涂写一整片过关，幻影涨到 5 颗）。
+                ch = max(2, int(round(min(dx, dy) * 0.064)))
+                core = float(np.median(gray[max(cy - ch, 0):cy + ch + 1,
+                                            max(cx - ch, 0):cx + ch + 1]))
+                # 试过两种放宽，都被真实照片否决，留档免得再走一遍：
+                # ① 全程改用环带核心（_core_bright，避开穿子线）：q4 铅笔涂写
+                #    一整片过关，幻影从 1 颗涨到 5 颗。
+                # ② 强环(>0.5/0.7)时兜底用环带核心：合成图能过，但 q4 幻影
+                #    涨到 3 颗，且涂写假环的 ring 比真白子还高，分不开。
+                # 最终只留中心窗判据——真实四题里只有 q4 残留 1 颗幻影 + 1 颗漏判，
+                # 交给画回确认门禁兜底，比放宽判据让每题都多几颗幻影划算。
+                # 双条件都是为了挡幻影（2026-09-09 调参，样本仅一本题册，换册需重标）：
+                # - ring>0.25：真白子 0.25~0.50；手写/阴影造成的假环 <0.2。
+                # - core>=med-15：真白子 core-med +2~+27；幻影 core-med 为负。
+                if ring > 0.25 and core >= med - 15:
                     white.add((ix, iy))
                     marks.append((cx, cy, r, "W"))
             # 否则：线可见且无描边 → 空点
@@ -534,9 +785,25 @@ def classify_stones(gray, xs, ys, circles):
 
 def _blue_mask(bgr):
     """蓝笔手写痕迹的 0/255 mask。蓝墨在灰度图里是暗色（~80-100），
-    不洗掉会被扫描分类当成黑子（实测数字"1"让空点 dark_frac=0.53 超标）。"""
+    不洗掉会被扫描分类当成黑子（实测数字"1"让空点 dark_frac=0.53 超标）。
+
+    双阈值：浓蓝（S>=60）之外兼容淡蓝/褪色蓝（H 蓝域 + S>=15 + V>=80）——
+    实测浅蓝圆珠笔 S 仅 15-50：S>=60 时 5 个答案数字只检出 1 个，S>=20 仍漏
+    最淡的"1"；V>=80 大体挡住黑色印刷线（V 50-90，实测两题图无线段误检，
+    残留风险由数字双门槛与画回确认门禁兜底）。铅笔（H~16）不在蓝域，免疫。"""
     hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     # 蓝笔：H 90~130（OpenCV 0-180）
+    strong = cv2.inRange(hsv, (85, 60, 40), (135, 255, 255))
+    faint = cv2.inRange(hsv, (85, 15, 80), (135, 255, 255))
+    mask = cv2.bitwise_or(strong, faint)
+    return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
+
+
+def _blue_mask_strong(bgr):
+    """浓蓝单阈值 mask（旧行为）。网格检测阶段专用：淡蓝墨迹在灰度里
+    与线同色，留着恰好"桥接"被手写字压断的线；洗掉了线反而断行
+    （实测右缘淡蓝数字洗掉后网格丢两行、相位崩）。分类阶段才用双阈值。"""
+    hsv = cv2.cvtColor(bgr, cv2.COLOR_BGR2HSV)
     mask = cv2.inRange(hsv, (85, 60, 40), (135, 255, 255))
     return cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((2, 2), np.uint8))
 
@@ -807,6 +1074,30 @@ def _extend_grid_edges(gray, xs, ys):
     return xs, ys
 
 
+def _quad_matches_grid(quad, xs, ys):
+    """四角四边形与网格范围一致性校验：边长须在网格跨度的 0.55~1.5 倍内。
+
+    透视会让对边长度不同（梯形畸变），但单边不可能偏离网格跨度一半以上。
+    _refine_corners 的暗像素拟合在弱线/棋子压线时会锁到石子边缘，
+    给出畸形四边形（实测底边拟合到棋子行，右侧边长仅为网格高的 0.49），
+    warp 后整盘压扁。此处拦截，回退原图均匀网格路径。"""
+    gw = float(xs[-1] - xs[0])
+    gh = float(ys[-1] - ys[0])
+    if gw <= 0 or gh <= 0:
+        return False
+    tl, tr, bl, br = quad
+
+    def dist(a, b):
+        return float(np.hypot(a[0] - b[0], a[1] - b[1]))
+
+    top, bot = dist(tl, tr), dist(bl, br)
+    left, right = dist(tl, bl), dist(tr, br)
+    for side, span in ((top, gw), (bot, gw), (left, gh), (right, gh)):
+        if not (0.55 * span <= side <= 1.5 * span):
+            return False
+    return True
+
+
 def _merge_digits(*digit_lists):
     """多源数字识别结果按交叉点取优。
     规则（两轮实测标定）：**纯按 conf 比较，平票才有读数者优先**——
@@ -933,15 +1224,261 @@ def _deskew_image(bgr):
     return out, True
 
 
-def recognize(photo_path):
-    """主入口。返回 dict：网格线数、黑白子（网格坐标）、蓝字编号、叠加核对图路径。
+def _peaks(hist, thr, min_gap=6):
+    """从 1D 直方图里取超阈值连续段的重心，间隔太近的合并。返回位置列表。"""
+    out, i, n = [], 0, len(hist)
+    while i < n:
+        if hist[i] >= thr:
+            j = i
+            while j + 1 < n and hist[j + 1] >= thr:
+                j += 1
+            seg = hist[i:j + 1]
+            c = float(np.average(np.arange(i, j + 1), weights=seg))
+            if out and c - out[-1] < min_gap:
+                out[-1] = (out[-1] + c) * 0.5
+            else:
+                out.append(c)
+            i = j + 1
+        else:
+            i += 1
+    return out
 
-    V2 管线（对标 GitHub 围棋识别最佳实践 GoChessParse/image2sgf/GOimage2SGF）：
-    1. 粗网格检测（detect_grid）拿行列数和粗网格
-    2. 四角精化（最外 4 条印刷线拟合求交）→ 逆透视变换拉正
-    3. warp 后网格严格等距（cell=44 常量），全交叉点扫描分类
-    4. 蓝字编号也在 warp 后图上识别（透视被矫正，模板匹配更准）
-    四角精化失败回退旧路径（原图均匀网格），保证不回归。"""
+
+def _vote_hists(gray, max_run=16, thr=195):
+    """细游程投票直方图：返回 (colh, rowh)。
+
+    colh[x] = 第 x 列上「细暗游程」覆盖的行数（竖线证据），rowh 同理。
+    只找线用（基于光照归一化图），绝不用于棋子分类。
+    """
+    H, W = gray.shape
+    bg = cv2.medianBlur(gray, 91)
+    norm = cv2.divide(gray, bg, scale=255)
+    dark = norm < thr
+    colh = np.zeros(W, float)
+    rowh = np.zeros(H, float)
+    for y in range(H):
+        row = dark[y]
+        i = 0
+        while i < W:
+            if row[i]:
+                j = i
+                while j + 1 < W and row[j + 1]:
+                    j += 1
+                if j - i + 1 <= max_run:
+                    colh[i:j + 1] += 1
+                i = j + 1
+            else:
+                i += 1
+    for x in range(W):
+        col = dark[:, x]
+        i = 0
+        while i < H:
+            if col[i]:
+                j = i
+                while j + 1 < H and col[j + 1]:
+                    j += 1
+                if j - i + 1 <= max_run:
+                    rowh[i:j + 1] += 1
+                i = j + 1
+            else:
+                i += 1
+    return colh, rowh
+
+
+def _refine_lines(gray, vals, s, lo, hi):
+    """逐线局部精修：等距拟合只是骨架，真实网格有透视残差（实测行距 106~134px 波动），
+    强制等距会在远端漂移半个格距（实测 q3 漂 47px，棋子分类采样点整行落错位置）。
+
+    评分 = 每个候选位置上「暗像素占比」，三道防线缺一不可：
+    - 阈值自适应（纸面中位 x0.85）：这两本题册纸面只有 135~150 亮，固定 185 会把
+      纸面全判暗，argmax 抓到窗口边缘、整盘网格系统性漂移半个格距（实测）。
+    - 并上光照归一化路（norm<195，与投票法同源）：照度不均时单阈值会漏线。
+    - 黑子是 86px 的大暗块，对窗口内所有候选位置贡献相同常数，不影响 argmax；
+      而 medianBlur 边界效应（黑子密集行 norm 失效）由 gray 阈值路兜住。
+    窗口 ±0.45s：< 0.5s 保证不会吸到邻线（邻线至少距 0.55s）。
+    """
+    H, W = gray.shape
+    med = float(np.median(gray))
+    bg = cv2.medianBlur(gray, 91)
+    norm = cv2.divide(gray, bg, scale=255)
+    dark = (gray < med * 0.85) | (norm < 195)
+    out = []
+    for v in vals:
+        a, b = int(round(v - 0.45 * s)), int(round(v + 0.45 * s))
+        a, b = max(a, 0), min(b, (H - 1))
+        seg = dark[a:b + 1, max(int(lo), 0):min(int(hi), W):4]
+        if seg.size == 0:
+            out.append(float(v))
+            continue
+        scores = seg.mean(axis=1)
+        out.append(float(a + int(np.argmax(scores))))
+    # 安全网：吸附后必须严格单调且间距合理，否则回退骨架值
+    ok = all(0.5 * s < out[i + 1] - out[i] < 1.5 * s for i in range(len(out) - 1))
+    return out if ok else list(vals)
+
+
+def detect_grid_vote(gray, max_run=16, thr=195, frac=0.15):
+    """细游程投票法检格——detect_grid 出幻影线时的稳健替代。
+
+    为什么需要第二条路：题图照片整体偏暗且带标题文字区时，detect_grid 会把文字行、
+    图外空白判成网格线（实测 q3/q4 检成 9 列 x 11 行，凭空多出两行两列幻影线，
+    连带在最外一圈认出一簇不存在的棋子）。全局阈值同样失效：纸面整片被判成暗。
+
+    做法：先用 medianBlur 做光照归一化（**只用于找线，绝不用于棋子分类**——核比棋子
+    小时大黑子会被当背景除掉），然后逐行找宽度 <= max_run 的细暗游程投给列直方图
+    得竖线，逐列同理得横线。棋子是宽游程（直径 ~86px），天然被排除在外。
+
+    返回 (xs, ys, [])（第三项留空以兼容 detect_grid 的返回结构），失败返回 None。
+    """
+    colh, rowh = _vote_hists(gray, max_run, thr)
+    H, W = gray.shape
+    xs = _peaks(colh, H * frac)
+    ys = _peaks(rowh, W * frac)
+    if len(xs) < 4 or len(ys) < 4:
+        return None
+    return xs, ys, []
+
+
+def _line_width_at(gray, cx, cy, dx, dy, half=18):
+    """过 (cx,cy) 沿法向 (dx,dy) 取 ±half 的一维剖面，返回暗游程宽度（半深法）。
+
+    自适应阈值 = 窗口内纸面分位与最暗值的中点。为什么不用全局阈值：题图亮度差得远，
+    固定阈值会把浅色印刷线整个漏掉。为什么不能先做背景减除（gray/medianBlur）：
+    模糊核比棋子小时，大黑子会被当成"背景"除掉，黑子在归一化图上反而变成纸面亮度
+    （2026-09-09 实测，黑子读数 252），这一步之后所有阈值全部失效。
+    返回 None 表示该处没有线（或整窗落在棋子上）。
+    """
+    H, W = gray.shape
+    cx, cy = int(round(cx)), int(round(cy))
+    # 采样窗整窗越界直接放弃：幻影线常落在图幅外（实测 q4 最外线 y=1385 = 图高），
+    # 不拦会 IndexError；也不能 clamp，clamp 出的假剖面会给出假的线宽。
+    if not (half <= cx < W - half and half <= cy < H - half):
+        return None
+    n = 2 * half + 1
+    prof = np.array([gray[int(round(cy + dy * t)), int(round(cx + dx * t))]
+                     for t in range(-half, half + 1)], float)
+    base = float(np.percentile(prof, 90))
+    vmin = float(prof.min())
+    if base - vmin < 18:
+        return None
+    dark = prof < (base + vmin) * 0.5
+    c = half
+    if not dark[c]:
+        return None
+    a = c
+    while a > 0 and dark[a - 1]:
+        a -= 1
+    b = c
+    while b < n - 1 and dark[b + 1]:
+        b += 1
+    return int(b - a + 1)
+
+
+def _grid_quality(gray, xs, ys):
+    """给一组线位打分：线上有墨的比例越高越好，间距越均匀越好。
+
+    detect_grid 在带标题文字/手写区的题图上会造出幻影线（实测 q3/q4 检成 9x11），
+    幻影线处没有真实墨迹，命中率会把分拉下来；同时它挤在真线之间，间距均匀性变差。
+    """
+    H, W = gray.shape
+
+    def support(lines, axis, lo, hi):
+        rates = []
+        for p in lines:
+            if not (0 <= p < (W if axis == "v" else H)):
+                rates.append(0.0)      # 幻影线可能落在图幅外，直接判零分
+                continue
+            hit = 0
+            ts = np.linspace(lo + 15, hi - 15, 50)
+            for t in ts:
+                # 采样点同样可能越界（幻影线的 lo/hi 本身就在图外）
+                if not (0 <= t < (H if axis == "v" else W)):
+                    continue
+                w = (_line_width_at(gray, p, t, 1, 0) if axis == "v"
+                     else _line_width_at(gray, t, p, 0, 1))
+                if w is not None and 2 <= w <= 25:
+                    hit += 1
+            rates.append(hit / len(ts))
+        return float(np.mean(rates)) if rates else 0.0
+
+    sup = 0.5 * (support(xs, "v", ys[0], ys[-1]) + support(ys, "h", xs[0], xs[-1]))
+    cvs = []
+    for lines in (xs, ys):
+        if len(lines) >= 3:
+            d = np.diff(lines)
+            cvs.append(float(np.std(d) / max(np.mean(d), 1e-6)))
+    cv = float(np.mean(cvs)) if cvs else 1.0
+    return sup - 0.6 * cv, sup, cv
+
+
+def _lattice_from_peaks(vals, s_lo=20, s_hi=200):
+    """从含杂峰的线位证据里拟合等距点阵（投票法的收尾步骤）。
+
+    投票法给出的峰值里，真网格线的间距会被杂峰切碎——实测 q3 一个 115px 的格子被切成
+    40/27/46/44/68 五段。所以不能按近邻合并：那会把两格并成一格（6 个峰缩成 1 条线，
+    实际应是 3 条）。正确做法是搜间距 s，用 _fit_lattice 拟合成等距点阵后按"节点有无
+    证据支撑"打分：真间距下每个节点附近都有证据；半间距留下一半空节点，倍间距会跳过真线。
+
+    间距初值取"不小于中位数的那些间隔的中位数"（杂峰间隔普遍偏小，会被这一步滤掉），
+    再在 ±20~25% 范围内细搜。
+    """
+    vals = sorted(float(v) for v in vals)
+    if len(vals) < 4:
+        return None
+    d = np.diff(vals)
+    big = d[d >= np.median(d)]
+    s0 = float(np.median(big)) if len(big) else 0.0
+    lo, hi = ((max(s_lo, s0 * 0.80), min(s_hi, s0 * 1.25))
+              if 20 <= s0 <= 200 else (s_lo, s_hi))
+    best, best_score = None, -1e9
+    s = lo
+    while s <= hi:
+        g = _fit_lattice(vals, s)
+        if g and 4 <= len(g) <= 21:
+            tol = s * 0.25
+            used = sum(1 for n in g if any(abs(v - n) < tol for v in vals))
+            err = float(np.mean([min(abs(v - n) for n in g) for v in vals]))
+            score = used - 1.2 * (len(g) - used) - err / tol
+            if score > best_score:
+                best, best_score = g, score
+        s += 0.5
+    return best
+
+
+def _flatten_outliers(vals, s):
+    """透视矫正后网格线近似等差排布（x = a + b·i）。逐线吸附仍可能被局部
+    暗结构带偏（实测 q4 三条竖线被铅笔手写拉偏 16~25px——蓝墨掩码洗不掉
+    灰黑铅笔字），用鲁棒直线拟合修正：残差 <=0.15s 的内点保留吸附值
+    （保留真实非线性），离群点取拟合值。"""
+    idx = np.arange(len(vals), dtype=float)
+    v = np.array(vals, float)
+    for _ in range(2):
+        # Theil-Sen：点对斜率的中位数。最小二乘会被强离群点带歪斜率、
+        # 把整组线拉漂（实测 ys[8] 偏 27px 时全盘漂移 27px）；Theil-Sen
+        # 容忍 <29% 离群。n<=21，O(n^2) 点对成本可忽略。
+        slopes = [(v[j] - v[i]) / (idx[j] - idx[i])
+                  for i in range(len(v)) for j in range(i + 1, len(v))]
+        b = float(np.median(slopes))
+        a = float(np.median(v - b * idx))
+        resid = v - (a + b * idx)
+        out = np.abs(resid) > 0.15 * s
+        if not out.any():
+            break
+        v[out] = a + b * idx[out]
+    return list(v)
+
+
+def prep_grid(photo_path):
+    """识别前段：读图 → 去斜 → 建三张灰图 → 检格 → 延伸 → 吸附。
+
+    抽出来是为了给角定位（corner.py）复用同一套线位：角判定要量「最外四条印刷线」
+    的线宽和出头，线位必须和棋子分类用的是同一组，否则两套坐标会各说各话。
+    corner 必须用**这一步的 xs/ys（透视矫正后、逆透视 warp 之前）**：
+    warp 之后最外四条线被拉到图像边界上，线宽和出头都量不到了。
+
+    返回 dict：bgr / gray / gray_grid / gray_cls / xs / ys / centers
+               / orig_bgr / orig_xs / orig_ys（warp 前留档，数字识别用）
+    """
     bgr = cv2.imread(photo_path)
     if bgr is None:
         raise ValueError("照片读取失败")
@@ -967,21 +1504,74 @@ def recognize(photo_path):
             mask = cv2.dilate(mask, np.ones((11, 11), np.uint8))
             bgr = cv2.inpaint(bgr, mask, 5, cv2.INPAINT_TELEA)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    # 蓝墨在灰度里是暗色，会污染黑子判定（圆盘暗像素占比）和检圆亮度验证，
-    # 所有棋形识别一律用洗掉蓝字后的灰度图；数字识别仍用原彩图
+    # 蓝墨在灰度里是暗色，会污染黑子判定（圆盘暗像素占比）和检圆亮度验证。
+    # 网格检测/吸附阶段用强蓝洗（gray_grid）：淡蓝墨迹留着能桥接被压断的线；
+    # 棋子分类阶段用双阈值洗（gray_cls）：淡蓝也是暗色污染，必须除尽。
+    gray_grid = gray.copy()
+    gray_grid[_blue_mask_strong(bgr) > 0] = 255
     gray_cls = gray.copy()
     gray_cls[_blue_mask(bgr) > 0] = 255
 
-    out = detect_grid(gray_cls)
+    out = detect_grid(gray_grid)
     if out is None:
         raise ValueError("未检测到棋盘网格，请重拍（正对题图、光线均匀、题图完整入镜）")
     xs, ys, centers = out
-    xs, ys = _extend_grid_edges(gray_cls, xs, ys)
+    xs, ys = _extend_grid_edges(gray_grid, xs, ys)
+    # 网格线吸附：圆心锚定的点阵有系统性偏移（边石子中心偏出+s累积），
+    # >10px 时扫描分类采样带套不住真线，邻子描边环进带致白子判空
+    xs, ys = _snap_grid_to_lines(gray_grid, xs, ys, centers)
 
+    # 幻影线兜底：detect_grid 在带标题文字/手写区的题图上会把图外内容判成网格线
+    # （实测 q3/q4 检成 9x11，凭空多两行两列，最外一圈还会认出一簇不存在的棋子）。
+    # 只在两套方法给出**不同行列数**时才允许切换，且必须质量分明显更高——
+    # 行列数一致时一律沿用原结果，避免动到已人工核对过的题图。
+    vg = detect_grid_vote(gray_grid)
+    if vg:
+        vx, vy = _lattice_from_peaks(vg[0]), _lattice_from_peaks(vg[1])
+        if vx and vy and (len(vx) != len(xs) or len(vy) != len(ys)):
+            q_old = _grid_quality(gray_grid, xs, ys)[0]
+            q_new = _grid_quality(gray_grid, vx, vy)[0]
+            if q_new > q_old + 0.05:
+                # 等距拟合只是骨架：真实网格有透视残差（行距 106~134px 波动），
+                # 必须逐线吸附回真实峰位，否则远端漂移半个格距
+                s_v = float(np.median(np.diff(vx)))
+                s_h = float(np.median(np.diff(vy)))
+                xs = _flatten_outliers(
+                    _refine_lines(gray_grid, vx, s_v, vy[0] - s_h, vy[-1] + s_h), s_v)
+                ys = _flatten_outliers(
+                    _refine_lines(gray_grid, vy, s_h, vx[0] - s_v, vx[-1] + s_v), s_h)
+    return {
+        "bgr": bgr, "gray": gray, "gray_grid": gray_grid, "gray_cls": gray_cls,
+        "xs": xs, "ys": ys, "centers": centers,
+        "orig_bgr": bgr, "orig_xs": list(xs), "orig_ys": list(ys),
+    }
+
+
+def recognize(photo_path, read_digits=False):
+    """主入口。返回 dict：网格线数、黑白子（网格坐标）、蓝字编号、叠加核对图路径。
+
+    read_digits：手写数字（作答顺序）识别开关，**2026-09-08 起默认关闭**。
+    用户判定该能力无实际价值（铅笔字读不出、圆珠笔读数要靠人复核，
+    省不掉人工却多一个误判来源），功能取消。代码保留以便日后回滚。
+    关闭时 digits 恒为空，识别提速且不产生任何"?"读数噪声。
+
+    V2 管线（对标 GitHub 围棋识别最佳实践 GoChessParse/image2sgf/GOimage2SGF）：
+    1. 粗网格检测（detect_grid）拿行列数和粗网格
+    2. 四角精化（最外 4 条印刷线拟合求交）→ 逆透视变换拉正
+    3. warp 后网格严格等距（cell=44 常量），全交叉点扫描分类
+    4. 蓝字编号也在 warp 后图上识别（透视被矫正，模板匹配更准）
+    四角精化失败回退旧路径（原图均匀网格），保证不回归。"""
+    P = prep_grid(photo_path)
+    bgr, gray_grid, gray_cls = P["bgr"], P["gray_grid"], P["gray_cls"]
+    xs, ys = P["xs"], P["ys"]
     # 原图留档：数字识别融合用（正视角下原图无插值模糊，数字更准）
-    orig_bgr, orig_xs, orig_ys = bgr, list(xs), list(ys)
+    orig_bgr, orig_xs, orig_ys = P["orig_bgr"], P["orig_xs"], P["orig_ys"]
 
-    quad = _refine_corners(gray_cls, xs, ys)
+    quad = _refine_corners(gray_grid, xs, ys)
+    if quad is not None and not _quad_matches_grid(quad, xs, ys):
+        # 角点拟合失败会给出畸形四边形（实测底线拟合到棋子上，
+        # 右侧边长只有网格高的一半），warp 后整盘压扁分类全崩
+        quad = None
     if quad is not None:
         # V2 主路径：逆透视拉正，网格变成精确等距常量
         wb, xs, ys = _warp_board(bgr, quad, len(xs), len(ys))
@@ -991,11 +1581,16 @@ def recognize(photo_path):
 
     black, white, marks = classify_by_sweep(gray_cls, xs, ys,
                                             ignore=_ignore_mask(bgr))
-    if quad is not None:
-        digits = _merge_digits(detect_blue_digits(orig_bgr, orig_xs, orig_ys),
-                               detect_blue_digits(bgr, xs, ys))
+    if read_digits:
+        # 手写数字识别（已默认关闭，见 recognize 文档）
+        if quad is not None:
+            digits = _merge_digits(
+                detect_blue_digits(orig_bgr, orig_xs, orig_ys),
+                detect_blue_digits(bgr, xs, ys))
+        else:
+            digits = detect_blue_digits(bgr, xs, ys)
     else:
-        digits = detect_blue_digits(bgr, xs, ys)
+        digits = []
 
     overlay = bgr.copy()
     for x in xs:
@@ -1018,18 +1613,135 @@ def recognize(photo_path):
     }
 
 
-def split_boards(photo_path):
-    """一图多题切分（印刷题图专用）。返回裁剪图的路径列表，单棋盘时长度为 1。
+def _spacing_mode(vals):
+    """从一组线位里估格距：相邻间距互相投票（容差 ±15%），取票数最多的那个。
 
-    GitHub 多棋盘识别项目（kaya-go/moku、tsoj/Chess_diagram_to_FEN 等）的共识
-    架构是「先切分出每个棋盘区域 → 每个区域独立走单盘管线」。切分用深度学习
-    目标检测太重且 moku 是 AGPL 协议（会传染公开仓库），印刷题图用传统 CV 即可：
-    HoughLinesP 检所有线段 → 线段包围盒按空间邻接做并查集聚类——同一棋盘的
-    横竖线互相交叉接触必然连通，题与题之间的空白天然断开 → 过滤噪声簇
-    （横竖线各不足 2 条、或包围盒太小的丢掉）→ 阅读顺序排序 → 加边裁剪。
+    为什么不用中位数：多题拼在一张图时，块间的大间距只有一两个，块内格距有十几个，
+    中位数在题数接近半数时才被带偏，而投票法在 >50% 的间距都是格距时必然取到格距。
+    """
+    if len(vals) < 3:
+        return None
+    ds = np.asarray(np.diff(vals), float)
+    ds = ds[(ds >= 8) & (ds <= 400)]
+    if len(ds) == 0:
+        return None
+    best, best_n = None, 0
+    for d in ds:
+        n = int(np.sum(np.abs(ds - d) <= d * 0.15))
+        # 平票时取**更大**的间距：杂峰（石子边缘/文字）只会制造比真格距更小的
+        # 间距，取小会踩坑——实测合成多题图上真格距 44 与杂峰间距 12/27 平票，
+        # 取小得到 12，按 1.7*12 断块把每行劈成碎片，裁出来只有 72px 高，
+        # 连网格都检不出（2026-09-09）。
+        if n > best_n or (n == best_n and best is not None and d > best):
+            best, best_n = float(d), n
+    return best
 
-    局限：两个棋盘贴得比邻接阈值还近时会并成一簇（此时整簇走单盘管线，
-    步骤②画回确认门禁兜底）；面向真实木盘/复杂背景不适用（同 classify_by_sweep）。
+
+def _group_lines(vals, s, min_lines=4):
+    """按间距断块：相邻线位间隔 > 1.7 个格距就认为是两道题。
+    少于 min_lines 条的碎块（文字行、噪线）丢掉。"""
+    groups, cur = [], [vals[0]]
+    for a, b in zip(vals, vals[1:]):
+        if b - a > 1.7 * s:
+            groups.append(cur)
+            cur = [b]
+        else:
+            cur.append(b)
+    groups.append(cur)
+    return [g for g in groups if len(g) >= min_lines]
+
+
+def split_boards(photo_path, frac=0.10, min_lines=4):
+    """一图多题切分（印刷题图专用）。返回裁剪图路径列表，单棋盘时长度为 1。
+
+    架构与 GitHub 多棋盘识别项目（kaya-go/moku、Chess_diagram_to_FEN）的共识一致：
+    「先切出每个棋盘区域 → 每块独立走单盘管线」。切分本身用传统 CV 就够
+    （深度学习目标检测太重，且 moku 是 AGPL 会传染公开仓库）。
+
+    **2026-09-09 重写**：旧版走 HoughLinesP 线段 + 包围盒并查集聚类，在真实题图上
+    实测不可用——拼 2 题/3 题的合成图都只切出 1 块：印刷网格线细且常被棋子压断，
+    Hough 只检到 17 条线段（两块 7x9 应有 30+ 条），每块都凑不齐"横竖各≥2 条"的
+    簇门槛，只剩一个簇。旧实现保留在 _split_boards_hough 供对照。
+
+    新版做法：复用单盘管线的细游程投票直方图（_vote_hists，本就是为了从弱线里找
+    网格而写的，比 Hough 稳得多）→ 取全图所有网格线峰位 → 投票估格距 →
+    按"间隔 > 1.7 格距"断成若干横/竖线组 → 横竖组笛卡尔积得到候选题块 →
+    每块裁下来重新投票自检（真块里必然还有 ≥4 条横竖线，错配的空白区检不到线，
+    用于过滤错位排版的伪组合）→ 阅读顺序排序 → 加边裁剪。
+
+    局限：① 两题间距 < 1.7 格距时会并成一块（此时整块走单盘管线，由画回确认
+    门禁兜底）；② 面向真实木盘/复杂背景不适用（同 classify_by_sweep 的说明）。
+    """
+    bgr = cv2.imread(photo_path)
+    if bgr is None:
+        raise ValueError("照片读取失败")
+    h, w = bgr.shape[:2]
+    if max(h, w) > 1600:
+        s = 1600 / max(h, w)
+        bgr = cv2.resize(bgr, (int(w * s), int(h * s)))
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray[_blue_mask(bgr) > 0] = 255  # 手写蓝字会截断线段，先洗掉
+    H, W = gray.shape
+
+    colh, rowh = _vote_hists(gray)
+    xs = _peaks(colh, H * frac)
+    ys = _peaks(rowh, W * frac)
+    if len(xs) < min_lines or len(ys) < min_lines:
+        return [photo_path]
+    sx, sy = _spacing_mode(xs), _spacing_mode(ys)
+    if not sx or not sy:
+        return [photo_path]
+    gx = _group_lines(xs, sx, min_lines)
+    gy = _group_lines(ys, sy, min_lines)
+    if len(gx) <= 1 and len(gy) <= 1:
+        return [photo_path]
+
+    # 加边：0.35 个格距（下限 20px）。太小切出来的块连网格都检不出——
+    # 实测 0.12s（s=44 时只有 10px）的合成块跑 prep_grid 直接报"未检测到网格"，
+    # 因为最外两条印刷线贴着图边，线宽/出头都没法量（同 corner 的注意事项）。
+    pad = int(max(20, 0.35 * min(sx, sy)))
+    regions = []
+    for vx in gx:
+        for hy in gy:
+            x1, x2 = int(vx[0]) - pad, int(vx[-1]) + pad
+            y1, y2 = int(hy[0]) - pad, int(hy[-1]) + pad
+            x1, y1 = max(x1, 0), max(y1, 0)
+            x2, y2 = min(x2, W), min(y2, H)
+            crop = gray[y1:y2, x1:x2]
+            if crop.shape[0] < 4 * sy or crop.shape[1] < 4 * sx:
+                continue
+            # 自检：真题块里横竖线都还在，错配的空白区检不出线
+            c2, r2 = _vote_hists(crop)
+            if (len(_peaks(c2, crop.shape[0] * frac)) < min_lines
+                    or len(_peaks(r2, crop.shape[1] * frac)) < min_lines):
+                continue
+            regions.append((x1, y1, x2, y2))
+
+    if len(regions) <= 1:
+        return [photo_path]
+
+    # 阅读顺序：先按行带（纵向分组）再按横向位置
+    med_h = sorted(r[3] - r[1] for r in regions)[len(regions) // 2]
+    band = max(med_h * 0.6, 1)
+    regions.sort(key=lambda r: (int((r[1] + r[3]) / 2) // band, r[0]))
+
+    # 写盘必须无损：白子判据（描边环采样，暗阈值 <120）对 JPEG 极敏感——
+    # 实测同一张图另存 jpg 后白子漏 7/7（q100 也漏 5/7），存 png 漏 0。
+    # 切分裁剪是有损链路上最容易被忽略的一环，这里统一用 png（2026-09-09）。
+    stem = photo_path.rsplit(".", 1)[0]
+    out = []
+    for i, (x1, y1, x2, y2) in enumerate(regions):
+        p = f"{stem}_b{i}.png"
+        cv2.imwrite(p, bgr[y1:y2, x1:x2])
+        out.append(p)
+    return out
+
+
+def _split_boards_hough(photo_path):
+    """旧版切分（HoughLinesP 线段 + 并查集聚类），2026-09-09 被 split_boards 取代。
+
+    保留原因：在新版表现不好的场景（例如题块贴得极近、或线极粗的数码图）
+    可以切回来做 A/B 对照，评测脚本直接换函数名即可。
     """
     bgr = cv2.imread(photo_path)
     if bgr is None:
@@ -1061,8 +1773,6 @@ def split_boards(photo_path):
 
     boxes = [(min(s[0], s[2]), min(s[1], s[3]),
               max(s[0], s[2]), max(s[1], s[3])) for s in segs]
-    # 邻接阈值：图片短边的 1%（下限 8px）。棋盘内部横竖线互相交叉，远小于此；
-    # 印刷题册题间距通常 ≥ 2 个格宽，远大于此。
     thr = max(8, min(bgr.shape[:2]) // 100)
     for i in range(n):
         bi = boxes[i]
@@ -1084,13 +1794,26 @@ def split_boards(photo_path):
         y1 = min(boxes[i][1] for i in idxs)
         x2 = max(boxes[i][2] for i in idxs)
         y2 = max(boxes[i][3] for i in idxs)
-        # 噪声过滤：真棋盘横竖线各 ≥2 条且尺寸像块棋盘
         if hs >= 2 and vs >= 2 and (x2 - x1) >= 60 and (y2 - y1) >= 60:
             clusters.append((x1, y1, x2, y2))
+
+    merged_any = True
+    while merged_any:
+        merged_any = False
+        for i in range(len(clusters)):
+            if merged_any:
+                break
+            for j in range(i + 1, len(clusters)):
+                a, b = clusters[i], clusters[j]
+                if a[0] < b[2] and b[0] < a[2] and a[1] < b[3] and b[1] < a[3]:
+                    clusters[i] = (min(a[0], b[0]), min(a[1], b[1]),
+                                   max(a[2], b[2]), max(a[3], b[3]))
+                    clusters.pop(j)
+                    merged_any = True
+                    break
     if len(clusters) <= 1:
         return [photo_path]
 
-    # 阅读顺序：先按行带（纵坐标分组）再按横坐标
     med_h = sorted(c[3] - c[1] for c in clusters)[len(clusters) // 2]
     band = max(med_h, 1) * 1.2
     clusters.sort(key=lambda c: (int(c[1] + (c[3] - c[1]) / 2) // band,
@@ -1098,7 +1821,7 @@ def split_boards(photo_path):
 
     stem = photo_path.rsplit(".", 1)[0]
     ext = photo_path.rsplit(".", 1)[1] if "." in photo_path else "jpg"
-    pad = 14  # 加边：给四角精化留点余量
+    pad = 14
     ih, iw = bgr.shape[:2]
     out = []
     for i, (x1, y1, x2, y2) in enumerate(clusters):

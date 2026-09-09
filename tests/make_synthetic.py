@@ -27,11 +27,18 @@ def make_photo(cols, rows, black, white, digits, out, rot=2.0, noise=True,
         # 描边 2px：1px 描边过 warp 双线性插值会被白芯冲淡消失
         cv2.circle(img, px(x, y), r, (50, 50, 50), 2)
     if line_through:
-        # 白子画完后再描一遍线 → 线从白子身上穿过；黑子后画仍盖线
+        # 白子画完后再描一遍线 → 线从白子身上穿过；黑子后画仍盖线。
+        # 但白子核心要留亮：真实题册放大看，白子处的线是被白芯盖住/印浅的，
+        # 整幅图里白子核心仍是纸色（实测四张真实照片 core-med +2~+27）。
+        # 早期版本让线满墨穿过子心，结果 7x7 核心窗（warp 后格距恒 44）里
+        # 一半像素是线、core 比空点还暗，白子判据全灭——那是夹具比真实题册
+        # 更极端，不是识别的问题（2026-09-09）。
         for x in range(cols):
             cv2.line(img, px(x, 0), px(x, rows - 1), (30, 30, 30), 2)
         for y in range(rows):
             cv2.line(img, px(0, y), px(cols - 1, y), (30, 30, 30), 2)
+        for x, y in white:
+            cv2.circle(img, px(x, y), max(int(cell * 0.22), 2), (250, 250, 250), -1)
     for x, y in black:
         cv2.circle(img, px(x, y), r, (25, 25, 25), -1)
     for seq, x, y in digits:
