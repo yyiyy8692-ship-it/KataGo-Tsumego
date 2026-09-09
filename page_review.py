@@ -14,7 +14,8 @@ import cv2
 import numpy as np
 from PIL import Image, ImageDraw, ImageFont
 
-from recognition import recognize_page
+from recognition import board, corner, detect as D
+from recognition import recognize_problem  # noqa: F401
 
 # ---- 配色（与 recognition/board.py 的 board_svg 保持一致）----
 C_BG = (255, 255, 255)
@@ -139,13 +140,63 @@ def make_card(crop_path, res, idx, total):
     return card
 
 
+def normalize_auto(crop_path, work_dir):
+    """小格距裁剪块做背景光照归一。
+
+    整页照的题块常带照片边缘阴影/相邻页暗角（实测 page1 第4题左上暗块把
+    左侧两列纸面拖进黑子阈值，整列误判黑 24 颗）。medianBlur 大核 + divide
+    归一后黑 24→9、白 7→9，且对已正确的题块无副作用（b4 前后一致）。
+    **只对小格距启用**：单题近拍黑子直径可到 110px，接近/超过核宽时
+    背景估计会把黑子本身当背景（norm 上黑子读 252，已有教训），故    格距
+    ≥60px 的一律用原图。
+    """
+    img = cv2.imread(crop_path)
+    gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+    try:
+        g = D.prep_grid(crop_path)
+        s = float(np.median(np.diff(g["xs"]))) if len(g["xs"]) > 1 else 999
+    except Exception:
+        s = 999
+    if s >= 60:
+        return crop_path
+    k = min(201, (min(gray.shape) // 2) * 2 - 1)
+    if k < 51:
+        return crop_path
+    bg = cv2.medianBlur(gray, k)
+    norm = cv2.divide(gray, bg, scale=255)
+    out = os.path.join(work_dir, os.path.basename(crop_path) + "_norm.png")
+    cv2.imwrite(out, cv2.cvtColor(norm, cv2.COLOR_GRAY2BGR))
+    return out
+
+
 def main():
     src = sys.argv[1] if len(sys.argv) > 1 else "photos/page1.jpg"
     outdir = sys.argv[2] if len(sys.argv) > 2 else "review_out"
     os.makedirs(outdir, exist_ok=True)
 
     print("切分：", src)
-    res = recognize_page(src)
+    parts = D.split_boards(src)
+    res = []
+    for i, p in enumerate(parts):
+        q = normalize_auto(p, outdir)
+        rec = D.recognize(q)
+        # 墙角判定用**原始裁剪**：归一重建图会破坏线宽/出头的测量
+        # （实测第4/5题 BR → BL conf=0.00）
+        loc = corner.locate(p)
+        name = "第 %d 题" % (i + 1) if len(parts) > 1 else\
+            os.path.basename(p).rsplit(".", 1)[0]
+        r = dict(rec)
+        r.update({
+            "photo": p,   # 对照图左侧始终展示原始裁剪
+            "corner": loc["corner"],
+            "confidence": loc["confidence"],
+            "need_confirm": loc["need_confirm"],
+            "board_svg": board.board_svg(name, rec["black"], rec["white"],
+                                         loc["corner"], cols=rec["cols"],
+                                         rows=rec["rows"]),
+        })
+        r["index"] = i
+        res.append(r)
     print("切出 %d 题" % len(res))
     cards = []
     for i, r in enumerate(res):
