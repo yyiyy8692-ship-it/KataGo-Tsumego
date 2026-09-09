@@ -16,3 +16,7 @@ venv/
 
 .DS_Store
 Thumb.db
+
+# 本地测试素材：含孩子作业照片与整页书影，不入库
+photos/
+review_out/
