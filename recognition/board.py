@@ -21,9 +21,9 @@ C_WHITE = "#FFFFFF"       # 白子
 C_WHITE_STROKE = "#C0C4C8"
 
 CORNER_LABEL = {"TL": "左 + 顶", "TR": "右 + 顶",
-                "BL": "左 + 底", "BR": "右 + 底"}
+                "BL": "左 + 底", "BR": "右 + 底", "FULL": "整盘（四边全边界）"}
 WALL_EDGES = {"TL": ("L", "T"), "TR": ("R", "T"),
-              "BL": ("L", "B"), "BR": ("R", "B")}
+              "BL": ("L", "B"), "BR": ("R", "B"), "FULL": None}
 
 
 def board_svg(name, black, white, corner, cols=7, rows=9,
@@ -54,21 +54,28 @@ def board_svg(name, black, white, corner, cols=7, rows=9,
         p.append(f'<line x1="{ax}" y1="{ay}" x2="{bx}" y2="{by}" '
                  f'stroke="{C_GRID}" stroke-width="2"/>')
 
-    # 2) 石墙：一条 L 形路径，拐角处尖角拼接（miter），两条边严丝合缝
-    wl, wt = WALL_EDGES[corner]
+    # 2) 石墙：一条 L 形路径，拐角处尖角拼接（miter），两条边严丝合缝；
+    #    corner="FULL"（整盘）画四条闭合边界墙
     sw = cell * 0.16
-    xc = cols - 1 if "R" in (wl, wt) else 0          # 墙角的列
-    yc = rows - 1 if "B" in (wl, wt) else 0          # 墙角的行
-    xf = 0 if xc == cols - 1 else cols - 1           # 横边的另一端
-    yf = 0 if yc == rows - 1 else rows - 1           # 竖边的另一端
-    ax, ay = px(xc, yf)
-    bx, by = px(xf, yc)
-    kx, ky = px(xc, yc)
-    ay += -over if yf == 0 else over                 # 竖边向外出头
-    bx += -over if xf == 0 else over                 # 横边向外出头
-    p.append(f'<path d="M {ax} {ay} L {kx} {ky} L {bx} {by}" fill="none" '
-             f'stroke="{C_WALL}" stroke-width="{sw:.1f}" stroke-linecap="round" '
-             f'stroke-linejoin="miter"/>')
+    if WALL_EDGES[corner] is None:
+        x1, y1 = px(0, 0)
+        x2, y2 = px(cols - 1, rows - 1)
+        p.append(f'<rect x="{x1}" y="{y1}" width="{x2 - x1}" height="{y2 - y1}" '
+                 f'fill="none" stroke="{C_WALL}" stroke-width="{sw:.1f}"/>')
+    else:
+        wl, wt = WALL_EDGES[corner]
+        xc = cols - 1 if "R" in (wl, wt) else 0          # 墙角的列
+        yc = rows - 1 if "B" in (wl, wt) else 0          # 墙角的行
+        xf = 0 if xc == cols - 1 else cols - 1           # 横边的另一端
+        yf = 0 if yc == rows - 1 else rows - 1           # 竖边的另一端
+        ax, ay = px(xc, yf)
+        bx, by = px(xf, yc)
+        kx, ky = px(xc, yc)
+        ay += -over if yf == 0 else over                 # 竖边向外出头
+        bx += -over if xf == 0 else over                 # 横边向外出头
+        p.append(f'<path d="M {ax} {ay} L {kx} {ky} L {bx} {by}" fill="none" '
+                 f'stroke="{C_WALL}" stroke-width="{sw:.1f}" stroke-linecap="round" '
+                 f'stroke-linejoin="miter"/>')
 
     # 3) 棋子
     r = cell * 0.44
@@ -88,6 +95,6 @@ def board_svg(name, black, white, corner, cols=7, rows=9,
     p.append(f'<text x="{w / 2}" y="{ty + 26}" font-size="14" '
              f'fill="{C_SUB}" text-anchor="middle" '
              f'font-family="PingFang SC, sans-serif">'
-             f'墙角 {CORNER_LABEL[corner]} ｜ 黑 {len(black)} · 白 {len(white)}</text>')
+             f'{CORNER_LABEL[corner]} ｜ 黑 {len(black)} · 白 {len(white)}</text>')
     p.append("</svg>")
     return "".join(p)

@@ -16,6 +16,7 @@ from PIL import Image, ImageDraw, ImageFont
 
 from recognition import board, corner, detect as D
 from recognition import recognize_problem  # noqa: F401
+from fullboard import probe_full, recognize_full_board
 
 # ---- 配色（与 recognition/board.py 的 board_svg 保持一致）----
 C_BG = (255, 255, 255)
@@ -27,9 +28,9 @@ C_BLACK = (42, 38, 32)
 C_WHITE = (255, 255, 255)
 C_WHITE_STROKE = (192, 196, 200)
 CORNER_LABEL = {"TL": "左 + 顶", "TR": "右 + 顶",
-                "BL": "左 + 底", "BR": "右 + 底"}
+                "BL": "左 + 底", "BR": "右 + 底", "FULL": "整盘（四边全边界）"}
 WALL_EDGES = {"TL": ("L", "T"), "TR": ("R", "T"),
-              "BL": ("L", "B"), "BR": ("R", "B")}
+              "BL": ("L", "B"), "BR": ("R", "B"), "FULL": None}
 
 FONT_CANDIDATES = [
     "/System/Library/Fonts/PingFang.ttc",
@@ -67,20 +68,31 @@ def draw_board(black, white, corner, cols=7, rows=9, cell=46, margin=44,
     for y in range(rows):
         d.line([px(0, y), px(cols - 1, y)], fill=C_GRID, width=lw)
 
-    wl, wt = WALL_EDGES[corner]
+    wl_wt = WALL_EDGES[corner]
     sw = max(1, int(cell * 0.16 * S))
-    xc = cols - 1 if "R" in (wl, wt) else 0
-    yc = rows - 1 if "B" in (wl, wt) else 0
-    xf = 0 if xc == cols - 1 else cols - 1
-    yf = 0 if yc == rows - 1 else rows - 1
-    ax, ay = px(xc, yf)
-    bx, by = px(xf, yc)
-    kx, ky = px(xc, yc)
-    ay += (-over if yf == 0 else over) * S
-    bx += (-over if xf == 0 else over) * S
-    d.line([(ax, ay), (kx, ky), (bx, by)], fill=C_WALL, width=sw, joint="curve")
+    if wl_wt is None:
+        # 整盘：四边全是粗边界墙
+        for (x1, y1), (x2, y2) in [
+                (px(0, 0), px(cols - 1, 0)),
+                (px(0, rows - 1), px(cols - 1, rows - 1)),
+                (px(0, 0), px(0, rows - 1)),
+                (px(cols - 1, 0), px(cols - 1, rows - 1))]:
+            d.line([(x1, y1), (x2, y2)], fill=C_WALL, width=sw)
+    else:
+        wl, wt = wl_wt
+        xc = cols - 1 if "R" in (wl, wt) else 0
+        yc = rows - 1 if "B" in (wl, wt) else 0
+        xf = 0 if xc == cols - 1 else cols - 1
+        yf = 0 if yc == rows - 1 else rows - 1
+        ax, ay = px(xc, yf)
+        bx, by = px(xf, yc)
+        kx, ky = px(xc, yc)
+        ay += (-over if yf == 0 else over) * S
+        bx += (-over if xf == 0 else over) * S
+        d.line([(ax, ay), (kx, ky), (bx, by)], fill=C_WALL, width=sw, joint="curve")
 
     r = cell * 0.44 * S
+    r = min(r, cell * S * 0.44)
     for x, y in black:
         cx, cy = px(x, y)
         d.ellipse([cx - r, cy - r, cx + r, cy + r], fill=C_BLACK)
@@ -94,8 +106,8 @@ def draw_board(black, white, corner, cols=7, rows=9, cell=46, margin=44,
     if name:
         bb = d.textbbox((0, 0), name, font=f1)
         d.text(((w * S - (bb[2] - bb[0])) / 2, ty), name, font=f1, fill=C_TEXT)
-    sub = "墙角 %s ｜ 黑 %d · 白 %d" % (CORNER_LABEL[corner],
-                                       len(black), len(white))
+    sub = "%s ｜ 黑 %d · 白 %d" % (CORNER_LABEL[corner],
+                                   len(black), len(white))
     bb = d.textbbox((0, 0), sub, font=f2)
     d.text(((w * S - (bb[2] - bb[0])) / 2, ty + 26 * S), sub, font=f2,
            fill=C_SUB)
@@ -130,10 +142,11 @@ def make_card(crop_path, res, idx, total):
     title = "第 %d 题 / 共 %d 题" % (idx + 1, total)
     d.text((pad, 30), title, font=f1, fill=C_TEXT)
     conf = res.get("confidence") or 0.0
-    flag = "  ⚠ 需人工确认墙角" if res.get("need_confirm") else ""
-    info = ("%d列 x %d行 ｜ 黑 %d · 白 %d ｜ 墙角 %s ｜ 置信度 %.2f%s"
+    corner_txt = CORNER_LABEL.get(res["corner"], "-")
+    flag = "  ⚠ 需人工确认" if res.get("need_confirm") else ""
+    info = ("%d列 x %d行 ｜ 黑 %d · 白 %d ｜ %s ｜ 置信度 %.2f%s"
             % (cols, rows, len(res["black"]), len(res["white"]),
-               CORNER_LABEL[res["corner"]], conf, flag))
+               corner_txt, conf, flag))
     d.text((pad, 66), info, font=f2, fill=C_SUB)
     note = "左：原图裁剪（%dx%d）　右：识别结果" % (bw, bh)
     d.text((pad, Ht - 30), note, font=f2, fill=(120, 124, 130))
@@ -179,10 +192,22 @@ def main():
     res = []
     for i, p in enumerate(parts):
         q = normalize_auto(p, outdir)
-        rec = D.recognize(q)
-        # 墙角判定用**原始裁剪**：归一重建图会破坏线宽/出头的测量
-        # （实测第4/5题 BR → BL conf=0.00）
-        loc = corner.locate(p)
+        # 整盘路由：acf 格距 <35px 视为 19 路全局题 → 走整盘专用管线
+        # （跳墙角判定、锁 19×19）。不能用 prep_grid 行列数路由——整页照
+        # 的整盘切块上它自己就检错（19x19 检成 11x10）。
+        is_full, _sp = probe_full(p)
+        if is_full:
+            try:
+                rec = recognize_full_board(p)
+            except Exception:
+                is_full = False     # 整盘管线失败（如格距误判的局部题）→ 回退
+            loc = {"corner": "FULL", "confidence": None,
+                   "need_confirm": True} if is_full else None
+        if not is_full:
+            rec = D.recognize(q)
+            # 墙角判定用**原始裁剪**：归一重建图会破坏线宽/出头的测量
+            # （实测第4/5题 BR → BL conf=0.00）
+            loc = corner.locate(p)
         name = "第 %d 题" % (i + 1) if len(parts) > 1 else\
             os.path.basename(p).rsplit(".", 1)[0]
         r = dict(rec)
