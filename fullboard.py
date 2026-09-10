@@ -138,8 +138,21 @@ def _refine_candidate(pks, vals, s0, n, rounds=3):
     return sc, cur
 
 
-def detect_full(gray, n=19):
-    """返回 (xs, ys)：n 条竖线、n 条横线（gray 坐标）。失败返回 None。"""
+def _line_images(dark, s):
+    """长核开运算得到的横/竖线增强二值图（曲线网格的局部重测要用）。"""
+    k = max(int(round(2.0 * s)), 15)
+    vline = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (1, k)))
+    hline = cv2.morphologyEx(dark, cv2.MORPH_OPEN,
+                             cv2.getStructuringElement(cv2.MORPH_RECT, (k, 1)))
+    return vline, hline
+
+
+def detect_full(gray, n=19, with_lines=False):
+    """返回 (xs, ys)：n 条竖线、n 条横线（gray 坐标）。失败返回 None。
+
+    with_lines=True 时额外返回 (vline, hline)，供 _curve_grid 局部重测。
+    """
     bg = cv2.medianBlur(gray, 91)
     norm = cv2.divide(gray, bg, scale=255)
     dark = ((gray < float(np.median(gray)) * 0.85) | (norm < 195)).astype(np.uint8) * 255
@@ -189,6 +202,9 @@ def detect_full(gray, n=19):
         for v, mv in zip(best, m):
             out.append(float(v if abs(v - mv) <= 0.3 * s0 else mv))
         axes.append(out)
+    if with_lines:
+        vline, hline = _line_images(dark, s_guess)
+        return axes[0], axes[1], vline, hline
     return axes[0], axes[1]
 
 
@@ -236,24 +252,33 @@ def _edge_has_structure(gcls, black, white, xs, ys, edge, n, s):
     return float(np.median(vals)) if vals else 0.0
 
 
-def recognize_full(gray, gcls, n=19):
-    """整盘入口：网格检测 → 分类 → 边缘假白子反馈平移（带验证）。
+def recognize_full(gray, gcls, n=19, curve=True):
+    """整盘入口：网格检测 → 曲线网格 → 分类 → 边缘假白反馈平移（带验证）。
+
+    curve=True（默认）启用分段曲线网格：书页弯曲使竖线成曲线（实测摆动
+    0.3~0.7 格），直线模型的采样点在弯曲区偏出交点，是"右上角不准"和
+    "白子全崩"的根因。旧版把曲线网格关掉是因为当时的白子判据依赖 ring，
+    对 ±1px 抖动极敏感（b1 白 39→12）；判据改为 core 主导后容忍度足够，
+    曲线网格才敢开。
 
     平移验证的必要性：错位一格的网格（锚到装订阴影带）平移修正后棋子
-    检出变全（实测 b0 22→32）；但边缘框线点被 ring 判据误判白时也会触发
-    平移信号（b1/b2），此时平移会把网格移出棋盘、棋子骤减——总数不降
-    才接受平移，否则维持原网格。
-    曲线网格（_curve_grid）实测弊大于利暂不启用：白子描边环判据对 ±1px
-    亚像素偏移极敏感（ring 0.13~0.33 跨在 0.12 门槛上），曲线重测的微小
-    抖动会让白子成片漏检（b1 白 39→12）。
+    检出变全（实测 b0 22→32）；但边缘框线点被误判白时也会触发平移信号
+    （b1/b2），此时平移会把网格移出棋盘、棋子骤减——总数不降才接受平移，
+    否则维持原网格。平移时 pts 同步平移，保持与 xs/ys 一致。
 
     返回 (xs, ys, black, white)。"""
-    xs, ys = detect_full(gray, n)
-    if xs is None:
+    det = detect_full(gray, n, with_lines=curve)
+    if det is None:
         return None
+    if curve:
+        xs, ys, vline, hline = det
+        pts = _curve_grid(vline, hline, xs, ys)
+    else:
+        xs, ys = det
+        pts = None
     s_x = float(np.median(np.diff(xs)))
     s_y = float(np.median(np.diff(ys)))
-    black, white, _ = classify_full(gcls, xs, ys)
+    black, white, _ = classify_full(gcls, xs, ys, pts)
     for _ in range(2):
         shift = _edge_ghost_shift(black, white, n)
         if shift is None:
@@ -261,24 +286,15 @@ def recognize_full(gray, gcls, n=19):
         sx, sy = shift
         xs_t = [x + sx * s_x for x in xs]
         ys_t = [y + sy * s_y for y in ys]
-    for _ in range(2):
-        shift = _edge_ghost_shift(black, white, n)
-        if shift is None:
-            break
-        sx, sy = shift
-        xs_t = [x + sx * s_x for x in xs]
-        ys_t = [y + sy * s_y for y in ys]
-        b_t, w_t, _ = classify_full(gcls, xs_t, ys_t)
+        pts_t = ([[(x + sx * s_x, y + sy * s_y) for (x, y) in row] for row in pts]
+                 if pts is not None else None)
+        b_t, w_t, _ = classify_full(gcls, xs_t, ys_t, pts_t)
         shift_t = _edge_ghost_shift(b_t, w_t, n)
         if shift_t is not None:
             if (shift_t[0] == -sx and sx != 0) or (shift_t[1] == -sy and sy != 0):
                 break      # 平移后指纹指向反方向：来回振荡，两解都有问题
-            # 平移后仍有新指纹：若新指纹边贴着真实线结构（框线被弯曲挤出
-            # 采样精度，b0 修正后的右边框），平移是有效的，接受；若新指纹
-            # 边周围无结构（网格移出棋盘落到纸面上，b1/b2 误移），拒绝。
-            # 指纹边映射：建议 sx=-1（左移）的指纹在右缘 R，以此类推。
-            edge = ("R", "L", "B", "T")[(0 if sx < 0 else 1 if sx > 0
-                                         else 2 if sy < 0 else 3)] if (sx or sy) else "R"
+            # 平移后仍有新指纹：若新指纹边贴着真实线结构，平移有效接受；
+            # 若新指纹边周围无结构（网格移出棋盘落到纸面上），拒绝。
             edge2 = ("R", "L", "B", "T")[(0 if shift_t[0] < 0 else 1 if shift_t[0] > 0
                                           else 2 if shift_t[1] < 0 else 3)]
             struct = _edge_has_structure(gcls, b_t, w_t, xs_t, ys_t, edge2, n,
@@ -287,83 +303,112 @@ def recognize_full(gray, gcls, n=19):
                 break
         if len(b_t) + len(w_t) < len(black) + len(white):
             break
-        xs, ys = xs_t, ys_t
+        xs, ys, pts = xs_t, ys_t, pts_t
         black, white = b_t, w_t
     return xs, ys, black, white
 
 
-def _nearest_peak(pks, v, tol_frac=0.35):
-    """v 附近 (±tol*格距由调用方保证) 最近最强峰位；无峰返回 None。"""
-    near = [p for p in pks if abs(p[0] - v) <= 8.0]
-    if not near:
-        return None
-    return max(near, key=lambda t: t[1])[0]
+def _seg_measure(line_img, orient, pos, a0, a1, s):
+    """段内局部峰位重测：返回 (相对偏移, 峰强)，无有效峰返回 (0.0, 0.0)。
+
+    只测 pos±0.35s 的小窗——书页弯曲量实测 0.3~0.7 格，窗口再大就会吸到
+    邻线（旧版吸飞 373px 就是窗口内没有本线、取到了噪声最大值）。
+    """
+    if orient == "v":
+        a0, a1 = max(int(a0), 0), min(int(a1), line_img.shape[0])
+        if a1 - a0 < 8:
+            return 0.0, 0.0
+        prof = line_img[a0:a1, :].sum(axis=0).astype(np.float64)
+    else:
+        a0, a1 = max(int(a0), 0), min(int(a1), line_img.shape[1])
+        if a1 - a0 < 8:
+            return 0.0, 0.0
+        prof = line_img[:, a0:a1].sum(axis=1).astype(np.float64)
+    w = max(int(round(0.35 * s)), 3)
+    p = int(round(pos))
+    lo, hi = max(p - w, 0), min(p + w + 1, len(prof))
+    if hi - lo < 3:
+        return 0.0, 0.0
+    seg = prof[lo:hi]
+    if seg.max() <= 0:
+        return 0.0, 0.0
+    k = lo + int(np.argmax(seg))
+    c0, c1 = max(k - 2, lo), min(k + 2, hi - 1)
+    wgt = prof[c0:c1 + 1] + 1e-6
+    peak = float((np.arange(c0, c1 + 1) * wgt).sum() / wgt.sum())
+    return peak - float(pos), float(seg.max())
 
 
-def _curve_grid(vline, hline, xs, ys, nseg=5):
-    """分段曲线网格：书页装订弯曲使网格线在图像里是曲线（实测边缘竖线
-    各高度 x 摆动 9~10px ≈ 0.5 格距，中部基本直），单一 x/y 坐标只在局部
-    贴合，弯曲区采样点偏出框线 → 边缘行列误判白子。
+def _fill_and_smooth(off, ok, lim):
+    """偏移矩阵：沿段插值补全 → 跨相邻线三点中位平滑 → 限幅。
 
-    每条竖线按 nseg 段在初值 ±0.3s 窗内重测局部 x，横线同理；交点
-    (i, j) 的 x 从竖线分段位置沿 y 插值、y 从横线分段位置沿 x 插值。
-    局部测量必须用**线增强图**（长核开运算）：原始暗图在棋子密集区
-    峰会落到棋子边缘（实测 b1 白子 39→7），线增强图里棋子已被滤除。
-    返回 pts[j][i] = (x, y)。"""
-    H = hline.shape[0]
+    跨线平滑的依据：书页弯曲是整页的连续形变，相邻网格线的局部偏移量必然
+    接近；单点跳变（吸飞）不会在邻线复现，中位滤波能直接把它踢掉。
+    """
+    m, k = off.shape
+    out = np.zeros_like(off)
+    idx = np.arange(k)
+    for i in range(m):
+        if not ok[i].any():
+            continue
+        out[i] = np.interp(idx, idx[ok[i]], off[i][ok[i]])
+    sm = out.copy()
+    for i in range(m):
+        lo, hi = max(i - 1, 0), min(i + 2, m)
+        sm[i] = np.median(out[lo:hi], axis=0)
+    return np.clip(sm, -lim, lim)
+
+
+def _curve_grid(vline, hline, xs, ys, nseg=6, lim_frac=0.5):
+    """分段曲线网格（稳健版）：交点 (i,j) 的真实像素坐标 pts[j][i]。
+
+    为什么必须用：书页沿纵向弯曲，竖线在图像里是曲线——实测竖线沿 y 的
+    横向摆动 5~14px（0.3~0.7 格），与棋子半径同量级；而横线只受透视影响，
+    间距序列平滑单调。单一 x 坐标的直线模型在弯曲区把采样点甩出交点，
+    交点坐标错 → 白子（依赖亚像素精度）全崩，右侧摆动最大处即"右上角不准"。
+
+    三道防吸飞锁（旧版实测吸飞率 2%~9%，b1 左侧 6 条线全飞到 250~374px）：
+    1 显著性：峰强 < 该方向中位峰强 45% 的测量点判噪声，弃用
+    2 限幅：相对全局线的偏移 > 0.5 格判吸飞，弃用
+    3 跨线平滑：相邻网格线偏移量做三点中位，单点跳变被邻线拉回
+    弃用点由插值补全，整条线无有效点则退化为全局直线（偏移 0）。
+    """
     sx = float(np.median(np.diff(xs)))
     sy = float(np.median(np.diff(ys)))
-    ny, nx = len(ys), len(xs)
+    nx, ny = len(xs), len(ys)
+    bv = np.linspace(0, vline.shape[0], nseg + 1)     # 竖线沿 y 分段
+    bh = np.linspace(0, hline.shape[1], nseg + 1)     # 横线沿 x 分段
 
-    def measure(line_img, orient, pos, a0, a1):
-        """沿垂直方向在 pos±0.3s 内测局部峰位（在对应方向的线增强图上）。"""
-        if orient == "v":
-            a0, a1 = max(int(a0), 0), min(int(a1), line_img.shape[0])
-            if a1 - a0 < 8:
-                return None
-            colsum = line_img[a0:a1, :].sum(axis=0).astype(np.float64)
-        else:
-            a0, a1 = max(int(a0), 0), min(int(a1), line_img.shape[1])
-            if a1 - a0 < 8:
-                return None
-            colsum = line_img[:, a0:a1].sum(axis=1).astype(np.float64)
-        s = sx if orient == "v" else sy
-        w = max(int(round(0.3 * s)), 3)
-        p = int(round(pos))
-        lo, hi = max(p - w, 0), min(p + w + 1, len(colsum))
-        if hi - lo < 3:
-            return None
-        seg = colsum[lo:hi]
-        if seg.max() <= 0:
-            return None
-        k = lo + int(np.argmax(seg))
-        c0, c1 = max(k - 2, lo), min(k + 2, hi - 1)
-        wgt = colsum[c0:c1 + 1] + 1e-6
-        return float((np.arange(c0, c1 + 1) * wgt).sum() / wgt.sum())
+    def build(line_img, orient, lines, s, bounds):
+        m = len(lines)
+        off = np.zeros((m, nseg))
+        pk = np.zeros((m, nseg))
+        ok = np.zeros((m, nseg), dtype=bool)
+        for i, p in enumerate(lines):
+            for k in range(nseg):
+                d, v = _seg_measure(line_img, orient, p,
+                                    bounds[k], bounds[k + 1] + 8, s)
+                if v <= 0:
+                    continue
+                off[i, k], pk[i, k], ok[i, k] = d, v, True
+        if ok.any():
+            ref = float(np.median(pk[ok]))
+            ok &= pk >= 0.45 * ref                 # 锁 1 显著性
+        ok &= np.abs(off) <= lim_frac * s          # 锁 2 限幅
+        return off, ok
 
-    seg_bounds_v = np.linspace(0, vline.shape[0], nseg + 1)   # 竖线分段沿 y
-    seg_bounds_h = np.linspace(0, hline.shape[1], nseg + 1)   # 横线分段沿 x
-    vpos = []
-    for x in xs:
-        segs = [measure(vline, "v", x, seg_bounds_v[k], seg_bounds_v[k + 1] + 8)
-                for k in range(nseg)]
-        vpos.append([m if m is not None else x for m in segs])
-    hpos = []
-    for y in ys:
-        segs = [measure(hline, "h", y, seg_bounds_h[k], seg_bounds_h[k + 1] + 8)
-                for k in range(nseg)]
-        hpos.append([m if m is not None else y for m in segs])
+    voff, vok = build(vline, "v", xs, sx, bv)
+    hoff, hok = build(hline, "h", ys, sy, bh)
+    voff = _fill_and_smooth(voff, vok, lim_frac * sx)   # 锁 3 平滑
+    hoff = _fill_and_smooth(hoff, hok, lim_frac * sy)
 
-    def interp(pos_arr, a, bounds):
-        mids = [(bounds[k] + bounds[k + 1]) / 2 for k in range(nseg)]
-        return float(np.interp(a, mids, pos_arr))
-
+    mids_v = (bv[:-1] + bv[1:]) / 2
+    mids_h = (bh[:-1] + bh[1:]) / 2
     pts = [[None] * nx for _ in range(ny)]
     for i in range(nx):
         for j in range(ny):
-            x_ij = interp(vpos[i], ys[j], seg_bounds_v)
-            y_ij = interp(hpos[j], xs[i], seg_bounds_h)
-            pts[j][i] = (x_ij, y_ij)
+            pts[j][i] = (float(xs[i] + np.interp(ys[j], mids_v, voff[i])),
+                         float(ys[j] + np.interp(xs[i], mids_h, hoff[j])))
     return pts
 
 
@@ -428,13 +473,31 @@ def recognize_full_board(photo_path, n=19):
     }
 
 
-def classify_full(gray_cls, xs, ys, pts=None):
-    """整盘专属分类：classify_by_sweep 的参数为 ~90px 格距近拍调优，
-    20px 格距整页照下描边环只有 ~1px、JPEG 模糊后灰度变淡，
-    ring 系统性偏低（实测真白子 0.13~0.33，近拍判据 0.25 会漏一半）。
-    整盘模式 ring 门槛降到 0.12，其余判据（亮核心、黑子双条件）不变；
-    幻影风险靠画回图人工核对兜底。"""
+def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
+                  diag=False):
+    """整盘专属分类：核心亮度主导 + 自适应阈值 + 交点校验。
+
+    判据选择依据（实测 page1_b0/b1/b2，格距 17.8~21.6px）：
+    ① 环判据（旧版）在 20px 格距下不可用：真白子 ring 0.13~0.39 与边缘伪影
+       0.13~0.29 完全重叠，且环上暗点只占 1~2 个象限（不是圆环）——1px 描边
+       经 JPEG + 缩放后已不存在。降门槛只会同时放进噪声，故整判据弃用。
+    ② 核心亮度才是可分特征：交点处两条线交叉，空格核心暗（众数 75~95），
+       白子是纸白（190~209）。但**必须抗偏移**：曲线网格的采样点仍有 ±2px
+       抖动，固定中心窗会把采样点偏到纸面上，空格 core 从 127 一路拖尾到
+       180，与白子粘成一片（实测连续单峰，无谷）。改用
+       3x3 中位 → 5x5 最小值（等价于"窗口内最暗的 3x3"），容忍 ±2px 偏移，
+       空格被压回 60~120，中间出现 40+ 灰阶的空隙。
+    ③ 阈值自适应：thr = 空格众数 + gap*(纸面中位 - 空格众数)。
+       纸色/墨色逐题不同（med 189~197、众数 75~95），固定阈值不可移植。
+       gap=0.70 实测三题阈值 155/165/166，落在各题空隙内；
+       gap 降到 0.55 会把拖尾空格吸进来（b1 白 24→29）。
+    ④ 交点校验：core 只在采样点压在交点上时才可分，要求至少一条线可见。
+    ⑤ 黑子判据不变（dark_frac 与 _big_dark_frac 双条件，实测 0.89~0.98）。
+
+    diag=True 时第三返回值为逐格特征表 (ix, iy, label, dark_frac, core, hv)。
+    """
     black, white, marks = set(), set(), []
+    rows = [] if diag else None
     dx = float(np.median(np.diff(xs)))
     dy = float(np.median(np.diff(ys)))
     s = min(dx, dy)
@@ -442,8 +505,9 @@ def classify_full(gray_cls, xs, ys, pts=None):
     nx, ny = len(xs), len(ys)
     rd = max(int(s * 0.38), 5)
     r_line = int(s * 0.35)
-    r_ring = max(int(s * 0.44), 6)
-    ch = max(2, int(round(s * 0.064)))
+    # 抗偏移核心亮度图：3x3 中位去噪 → 5x5 最小值
+    core_map = cv2.erode(cv2.medianBlur(gray_cls, 3), np.ones((5, 5), np.uint8))
+    cores, cand = [], []
     for ix in range(nx):
         for iy in range(ny):
             if pts is not None:
@@ -451,6 +515,8 @@ def classify_full(gray_cls, xs, ys, pts=None):
             else:
                 fx, fy = xs[ix], ys[iy]
             cx, cy = int(round(fx)), int(round(fy))
+            cx = int(np.clip(cx, 0, gray_cls.shape[1] - 1))
+            cy = int(np.clip(cy, 0, gray_cls.shape[0] - 1))
             disc = gray_cls[max(cy - rd, 0):cy + rd + 1,
                             max(cx - rd, 0):cx + rd + 1]
             dark_frac = float(np.mean(disc < 110)) if disc.size else 0.0
@@ -458,14 +524,35 @@ def classify_full(gray_cls, xs, ys, pts=None):
                     gray_cls, cx, cy, max(int(s * 0.44), 6)) > 0.5:
                 black.add((ix, iy))
                 marks.append((cx, cy, r_line, "B"))
+                if diag:
+                    rows.append((ix, iy, "B", dark_frac, 0.0, 0.0))
                 continue
+            core = float(core_map[cy, cx])
+            cores.append(core)
+            cand.append((ix, iy, cx, cy, core, dark_frac))
+    # 自适应阈值：空格众数 → 纸面中位 之间按 gap 取点
+    if cores:
+        h, e = np.histogram(np.asarray(cores),
+                            bins=np.arange(60, max(min(med, 250), 70), 10))
+        mode = float(e[int(np.argmax(h))] + 5) if len(h) else float(np.median(cores))
+        thr = mode + gap * (med - mode)
+    else:
+        thr = med - 10.0
+    for (ix, iy, cx, cy, core, dark_frac) in cand:
+        hv = 1.0
+        if need_cross:
             hf, vf = D._line_visibility(gray_cls, cx, cy, r_line,
                                         ix == 0, ix == nx - 1,
                                         iy == 0, iy == ny - 1)
-            ring = D._ring_outline_frac(gray_cls, cx, cy, r_ring)
-            core = float(np.median(gray_cls[max(cy - ch, 0):cy + ch + 1,
-                                            max(cx - ch, 0):cx + ch + 1]))
-            if max(hf, vf) <= 0.4 or (ring > 0.12 and core >= med - 15):
-                white.add((ix, iy))
-                marks.append((cx, cy, r_line, "W"))
-    return black, white, marks
+            hv = max(hf, vf)
+            if hv < 0.5:
+                if diag:
+                    rows.append((ix, iy, ".", dark_frac, core, hv))
+                continue
+        is_white = core >= thr
+        if is_white:
+            white.add((ix, iy))
+            marks.append((cx, cy, r_line, "W"))
+        if diag:
+            rows.append((ix, iy, "W" if is_white else ".", dark_frac, core, hv))
+    return black, white, marks if not diag else (black, white, rows)
