@@ -272,13 +272,21 @@ def recognize_full(gray, gcls, n=19, curve=True):
         return None
     if curve:
         xs, ys, vline, hline = det
+        s0 = min(float(np.median(np.diff(xs))), float(np.median(np.diff(ys))))
         pts = _curve_grid(vline, hline, xs, ys)
+        pts, has = _snap_to_cross(vline, hline, pts, s0)
+        # 邻居插值（_interp_missing）实测弊大于利：白子处采样点被"修正"后，
+        # 反而把已判对的白子挪出圆心（b1 的 i2j12 丢失，b0/b2 各多一个幻影）。
+        # 根因是白子盖住线后，插值依据的邻点本身跨了 1~2 格，误差被放大。
+        # 保留实现备查，但默认不启用。
+        # pts = _interp_missing(pts, has, len(xs), len(ys))
     else:
         xs, ys = det
         pts = None
+    gnorm = _illum_normalize(gcls)
     s_x = float(np.median(np.diff(xs)))
     s_y = float(np.median(np.diff(ys)))
-    black, white, _ = classify_full(gcls, xs, ys, pts)
+    black, white, _ = classify_full(gcls, xs, ys, pts, gray_norm=gnorm)
     for _ in range(2):
         shift = _edge_ghost_shift(black, white, n)
         if shift is None:
@@ -288,7 +296,7 @@ def recognize_full(gray, gcls, n=19, curve=True):
         ys_t = [y + sy * s_y for y in ys]
         pts_t = ([[(x + sx * s_x, y + sy * s_y) for (x, y) in row] for row in pts]
                  if pts is not None else None)
-        b_t, w_t, _ = classify_full(gcls, xs_t, ys_t, pts_t)
+        b_t, w_t, _ = classify_full(gcls, xs_t, ys_t, pts_t, gray_norm=gnorm)
         shift_t = _edge_ghost_shift(b_t, w_t, n)
         if shift_t is not None:
             if (shift_t[0] == -sx and sx != 0) or (shift_t[1] == -sy and sy != 0):
@@ -306,6 +314,93 @@ def recognize_full(gray, gcls, n=19, curve=True):
         xs, ys, pts = xs_t, ys_t, pts_t
         black, white = b_t, w_t
     return xs, ys, black, white
+
+
+def _illum_normalize(gray):
+    """光照归一：大核中位估背景 → 原图/背景。
+
+    必要性：装订侧阴影把整片纸面压暗（实测 b1 左下角空格 core 85~153，
+    而全局阈值 166），全局阈值的白子判据会把阴影区的真白子全部误杀。
+    归一后同一批格子回到 110~198，与全图尺度一致。
+    """
+    bg = cv2.medianBlur(gray, 91)
+    return np.clip(gray.astype(np.float32) / np.maximum(bg.astype(np.float32), 1.0) * 255.0,
+                   0, 255).astype(np.uint8)
+
+
+def _snap_to_cross(vline, hline, pts, s, win=0.45):
+    """把交点吸附到真实的线交叉像素团（治曲线模型的残余偏差）。
+
+    竖线增强图 ∩ 横线增强图 = 交点像素。曲线网格在端点、弯曲剧烈处仍有
+    3~6px 残差（实测 b2 右端 i=18 列 j=3~5 的采样点落到框外纸面：竖线宽 0、
+    core 194 → 判成白子）。真实交点必然同时属于 vline 和 hline，取窗内
+    像素的距离加权质心即可，不再依赖模型外推。
+
+    返回 (pts, has)：has[j][i] 表示该处是否真的找到了交点像素。
+    子（黑/白）会把线盖住 → 无交点像素 → has=False，位置需由邻居插值。
+    """
+    cross = cv2.bitwise_and(vline, hline)
+    cross = cv2.dilate(cross, np.ones((3, 3), np.uint8))
+    yy, xx = np.nonzero(cross)
+    ny, nx = len(pts), len(pts[0])
+    has = [[False] * nx for _ in range(ny)]
+    if len(xx) == 0:
+        return pts, has
+    r2 = (win * s) ** 2
+    out = [[None] * nx for _ in range(ny)]
+    for j in range(ny):
+        for i in range(nx):
+            fx, fy = pts[j][i]
+            d2 = (xx - fx) ** 2 + (yy - fy) ** 2
+            m = d2 <= r2
+            if m.any():
+                w = 1.0 / (d2[m] + 1e-6)      # 距离加权：靠近模型值的像素权重大
+                out[j][i] = (float((xx[m] * w).sum() / w.sum()),
+                             float((yy[m] * w).sum() / w.sum()))
+                has[j][i] = True
+            else:
+                out[j][i] = (float(fx), float(fy))
+    return out, has
+
+
+def _interp_missing(pts, has, nx, ny):
+    """无线交叉像素的格子（子盖住了线）用相邻已定位格子插值补位。
+
+    为什么必要：白子/黑子把网格线盖住，交点像素消失，snap 无法定位，只能
+    退回曲线模型值（弯曲区偏差 3~6px）。实测 b1 左下角就有白子因采样点偏
+    到白子边缘，core 只有 171（纸白是 250）而被阈值误杀。
+    棋盘是规则网格、相邻交点等距，用同行/同列最近的两个已定位点线性插值，
+    误差 <2px；只有一侧有点时用两点外推，仍无点则保持模型值。
+    """
+    out = [[tuple(p) for p in row] for row in pts]
+
+    def _fill(i, j, axis):
+        """axis=0 取 x（沿 i 方向插值），axis=1 取 y（沿 j 方向插值）。"""
+        line = pts[j] if axis == 0 else [pts[jj][i] for jj in range(ny)]
+        ok = [has[j][ii] for ii in range(nx)] if axis == 0 else \
+             [has[jj][i] for jj in range(ny)]
+        k = i if axis == 0 else j
+        n = nx if axis == 0 else ny
+        lo = next((k - d for d in range(1, n) if k - d >= 0 and ok[k - d]), None)
+        hi = next((k + d for d in range(1, n) if k + d < n and ok[k + d]), None)
+        if lo is not None and hi is not None:
+            return line[lo][axis] + (line[hi][axis] - line[lo][axis]) * (k - lo) / (hi - lo)
+        if lo is not None:                       # 左侧两点外推
+            ll = next((lo - d for d in range(1, n) if lo - d >= 0 and ok[lo - d]), None)
+            if ll is not None:
+                return line[lo][axis] + (line[lo][axis] - line[ll][axis]) / (lo - ll) * (k - lo)
+        elif hi is not None:                     # 右侧两点外推
+            hh = next((hi + d for d in range(1, n) if hi + d < n and ok[hi + d]), None)
+            if hh is not None:
+                return line[hi][axis] + (line[hh][axis] - line[hi][axis]) / (hh - hi) * (k - hi)
+        return line[k][axis]
+
+    for j in range(ny):
+        for i in range(nx):
+            if has[j][i]:
+                continue
+            out[j][i] = (float(_fill(i, j, 0)), float(_fill(i, j, 1)))
+    return out
 
 
 def _seg_measure(line_img, orient, pos, a0, a1, s):
@@ -474,7 +569,7 @@ def recognize_full_board(photo_path, n=19):
 
 
 def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
-                  diag=False):
+                  gray_norm=None, cross_min=0.5, diag=False):
     """整盘专属分类：核心亮度主导 + 自适应阈值 + 交点校验。
 
     判据选择依据（实测 page1_b0/b1/b2，格距 17.8~21.6px）：
@@ -491,8 +586,14 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
        纸色/墨色逐题不同（med 189~197、众数 75~95），固定阈值不可移植。
        gap=0.70 实测三题阈值 155/165/166，落在各题空隙内；
        gap 降到 0.55 会把拖尾空格吸进来（b1 白 24→29）。
-    ④ 交点校验：core 只在采样点压在交点上时才可分，要求至少一条线可见。
-    ⑤ 黑子判据不变（dark_frac 与 _big_dark_frac 双条件，实测 0.89~0.98）。
+    ④ 交点校验：core 只在采样点压在交点上时才可分，要求横竖两条线**都**
+       可见（min(hf,vf)>=cross_min）。用 max 不够——实测 b1 右下角 (18,18) 的
+       采样点跑到棋盘外，max(hf,vf)=0.57 仍能过闸，min=0.43 才挡得住；而
+       真白子处（本册是线穿白子印刷）min 一律 1.0，不受影响。
+    ⑤ 光照归一：core 与阈值都在 gray_norm 上算，避免装订侧阴影误杀白子
+       （实测 b1 左下角空格 core 85~153 被全局阈值 166 砍掉）。
+    ⑥ 黑子判据不变（dark_frac 与 _big_dark_frac 双条件，实测 0.89~0.98），
+       仍在原始灰度上算——归一图的绝对阈值不适用于黑子。
 
     diag=True 时第三返回值为逐格特征表 (ix, iy, label, dark_frac, core, hv)。
     """
@@ -501,12 +602,13 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
     dx = float(np.median(np.diff(xs)))
     dy = float(np.median(np.diff(ys)))
     s = min(dx, dy)
-    med = float(np.median(gray_cls))
+    gnorm = _illum_normalize(gray_cls) if gray_norm is None else gray_norm
+    med = float(np.median(gnorm))
     nx, ny = len(xs), len(ys)
     rd = max(int(s * 0.38), 5)
     r_line = int(s * 0.35)
-    # 抗偏移核心亮度图：3x3 中位去噪 → 5x5 最小值
-    core_map = cv2.erode(cv2.medianBlur(gray_cls, 3), np.ones((5, 5), np.uint8))
+    # 抗偏移核心亮度图（在光照归一图上）：3x3 中位去噪 → 5x5 最小值
+    core_map = cv2.erode(cv2.medianBlur(gnorm, 3), np.ones((5, 5), np.uint8))
     cores, cand = [], []
     for ix in range(nx):
         for iy in range(ny):
@@ -533,7 +635,7 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
     # 自适应阈值：空格众数 → 纸面中位 之间按 gap 取点
     if cores:
         h, e = np.histogram(np.asarray(cores),
-                            bins=np.arange(60, max(min(med, 250), 70), 10))
+                            bins=np.arange(20, max(min(med, 250), 40), 10))
         mode = float(e[int(np.argmax(h))] + 5) if len(h) else float(np.median(cores))
         thr = mode + gap * (med - mode)
     else:
@@ -544,8 +646,8 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
             hf, vf = D._line_visibility(gray_cls, cx, cy, r_line,
                                         ix == 0, ix == nx - 1,
                                         iy == 0, iy == ny - 1)
-            hv = max(hf, vf)
-            if hv < 0.5:
+            hv = min(hf, vf)
+            if hv < cross_min:
                 if diag:
                     rows.append((ix, iy, ".", dark_frac, core, hv))
                 continue
@@ -555,4 +657,6 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
             marks.append((cx, cy, r_line, "W"))
         if diag:
             rows.append((ix, iy, "W" if is_white else ".", dark_frac, core, hv))
-    return black, white, marks if not diag else (black, white, rows)
+    if diag:
+        return black, white, rows
+    return black, white, marks
