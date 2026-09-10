@@ -1756,6 +1756,78 @@ def _group_lines(vals, s, min_lines=4):
     return [g for g in groups if len(g) >= min_lines]
 
 
+def _spacing_cv(peaks):
+    """峰间距的变异系数 std/mean —— 网格规整性度量。
+
+    文字段落同样能凑出峰位，甚至被 _stone_count 数出"棋子"（实测整页里
+    一段说明文字被数出 19 个假白子、最终切成 6x9 空棋盘），但它的行距/
+    字距忽大忽小；真棋盘的线是等距的，CV 明显更低。
+    实测（原分辨率题块）：19 路整盘 0.32/0.45，手筋题 0.44~0.56，
+    文字块 1.02 —— 阈值 0.70 有足够余量。
+    """
+    p = np.asarray(peaks, dtype=np.float64).ravel()
+    if len(p) < 4:
+        return 0.0
+    d = np.diff(p)
+    d = d[d > 0]
+    if len(d) < 3 or float(np.mean(d)) <= 0:
+        return 0.0
+    return float(np.std(d) / np.mean(d))
+
+
+def _line_continuity(dark, peaks, orient="v", tol=1):
+    """线贯穿度：每条峰位线上，暗像素沿垂直方向的覆盖率中位数。
+
+    棋盘线是**贯穿整块**的连续线；文字笔画是断开的短划。实测（原分辨率
+    题块）：19 路整盘 0.46~0.68、手筋题 0.60~0.74、合成小盘 0.41~0.49，
+    而整页里混进来的一段说明文字只有 0.19/0.31。
+    必须在原分辨率裁剪块上测——降采样图的细线被平滑后区分度会掉。
+    """
+    vals = []
+    for p in peaks:
+        p = int(round(p))
+        if orient == "v":
+            if 0 <= p < dark.shape[1]:
+                vals.append(float(dark[:, max(p - tol, 0):p + tol + 1]
+                                  .max(axis=1).mean()))
+        else:
+            if 0 <= p < dark.shape[0]:
+                vals.append(float(dark[max(p - tol, 0):p + tol + 1, :]
+                                  .max(axis=0).mean()))
+    return float(np.median(vals)) if vals else 0.0
+
+
+def _block_is_grid(path, max_cv=0.85):
+    """终检：最终裁剪块到底是不是棋盘（网格间距规整性闸门）。
+
+    形态学块检测 + _stone_count 兜底会把文字段落放进来（实测整页里一段
+    说明文字被数出 19 个"白子"，切成一块 6x9 空棋盘）。文字的行距/字距
+    忽大忽小，而真棋盘的线是等距的——用 max(竖CV, 横CV) 区分。
+
+    实测（**原分辨率**裁剪块）：真棋盘 0.24~0.60（拍照整页 6 块 + PDF
+    打印稿 6 块）、合成小盘 0.68~0.75、文字段落 1.06。故阈值取 0.85
+    ——对合成盘留 0.10 余量，对文字段落留 0.21。
+
+    两个坑（都踩过，2026-09-10）：
+    ① 必须在**原分辨率**块上算。降采样图上文字块的 CV 只有 0.68，与真
+       棋盘（0.51）重叠，会误杀真题块（拍照整页 6 题 → 5 题）。
+    ② 别用"线贯穿度"做这件事。拍照图的网格线本身断续（0.24~0.46），
+       与文字块（0.19）挨得太近，同样会误杀（第 6 题 0.24 被砍）。
+    峰位太少（<4）时不作判断，交回原有逻辑，避免误杀小图。
+    """
+    bgr = cv2.imread(path)
+    if bgr is None:
+        return False
+    gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
+    gray[_blue_mask(bgr) > 0] = 255
+    colh, rowh = _vote_hists(gray)
+    xs = _peaks(colh, gray.shape[0] * 0.10)
+    ys = _peaks(rowh, gray.shape[1] * 0.10)
+    if len(xs) < 4 or len(ys) < 4:
+        return True
+    return max(_spacing_cv(xs), _spacing_cv(ys)) <= max_cv
+
+
 def _grid_like_check(colh, rowh, crop_shape, frac=0.10, min_lines=5):
     """裁剪区自检（快速路）：像不像一块真棋盘（横竖线多且间距规整）。
 
@@ -1940,14 +2012,20 @@ def split_boards(photo_path, frac=0.10, min_lines=4):
 
     局限：① 两题间距 < 1 格距时会并成一块（此时整块走单盘管线，由画回确认
     门禁兜底）；② 面向真实木盘/复杂背景不适用（同 classify_by_sweep 的说明）。
+
+    2026-09-10：检测仍在降采样图（形态学核是固定像素尺度），但**裁剪改为
+    回原图**——整页 2481x3508 缩到 1600 后单个题图只剩 ~450px、格距 23px，
+    白白丢掉一半以上分辨率（PDF 打印稿的题图原为 975px、格距 54px）。
     """
     bgr = cv2.imread(photo_path)
     if bgr is None:
         raise ValueError("照片读取失败")
+    bgr_full = bgr
+    scale = 1.0
     h, w = bgr.shape[:2]
     if max(h, w) > 1600:
-        s = 1600 / max(h, w)
-        bgr = cv2.resize(bgr, (int(w * s), int(h * s)))
+        scale = 1600 / max(h, w)
+        bgr = cv2.resize(bgr, (int(w * scale), int(h * scale)))
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gray[_blue_mask(bgr) > 0] = 255  # 手写蓝字会截断线段，先洗掉
     H, W = gray.shape
@@ -1981,6 +2059,13 @@ def split_boards(photo_path, frac=0.10, min_lines=4):
             sx, sy = cell, cell
             xs = np.asarray(_peaks(colh, crop.shape[0] * frac))
             ys = np.asarray(_peaks(rowh, crop.shape[1] * frac))
+        # 间距规整性闸门：_stone_count 兜底路径会放进文字段落（实测整页里
+        # 一段说明文字被数出 19 个假白子，切出一块 6x9 空棋盘）。文字的行距
+        # /字距忽大忽小，峰间距变异系数远高于真棋盘（见 _spacing_cv 实测值）。
+        # 注：曾在此加「峰间距变异系数 >0.70 则剔除」的闸门想滤掉文字段落，
+        # 但降采样图上文字块的 CV 只有 0.68、与真棋盘（0.51）重叠，滤不掉
+        # 反而误杀真题块（实测拍照整页 6 题 → 5 题，2026-09-10）。文字过滤
+        # 改用 _block_is_grid 的线贯穿度判据，区分度干净（0.19 vs 0.41+）。
         if len(xs) and len(ys):
             # 收紧到**强线峰**范围（_line_extent），并**钳制在 blob 框内**：
             # 直接取峰位 min/max 会被题号文字/阴影带凑出的弱峰撑大（实测把
@@ -2023,15 +2108,57 @@ def split_boards(photo_path, frac=0.10, min_lines=4):
     # 因为最外两条印刷线贴着图边，线宽/出头都没法量（同 corner 的注意事项）。
     out = []
     stem = photo_path.rsplit(".", 1)[0]
+    # 检测坐标 → 原图坐标（见 split_boards 文档 2026-09-10 条）
+    inv = (1.0 / scale) if scale and scale != 1.0 else 1.0
+    FH, FW = bgr_full.shape[:2]
     for i, r in enumerate(regions):
         pad = int(max(20, 0.35 * r[4])) if r[4] else 20
-        x1, y1 = max(int(r[0]) - pad, 0), max(int(r[1]) - pad, 0)
-        x2, y2 = min(int(r[2]) + pad, W), min(int(r[3]) + pad, H)
+        pl = pt = pr = pb = pad
+        # pad 不能跨过与邻居的间隙——否则会把邻居盘的边框/题号包进来。
+        # 实测 PDF 打印稿：下一行手筋题的上边 pad 吃进上一行整盘题底部
+        # 45px，多出一行假网格（7x9 被撑成 7x11，首行空、次行 5 连白）。
+        # 方向性收紧：只在**朝向该邻居的一侧**收 pad，其余三侧保持，
+        # 免得为了避让上下邻居把左右边框也切没了。
+        for k, o in enumerate(regions):
+            if k == i:
+                continue
+            if o[0] < r[2] and o[2] > r[0]:          # 水平投影重叠 → 上下邻居
+                if o[3] <= r[1]:
+                    pt = min(pt, max(2, int((r[1] - o[3]) * 0.5)))
+                elif o[1] >= r[3]:
+                    pb = min(pb, max(2, int((o[1] - r[3]) * 0.5)))
+            if o[1] < r[3] and o[3] > r[1]:          # 垂直投影重叠 → 左右邻居
+                if o[2] <= r[0]:
+                    pl = min(pl, max(2, int((r[0] - o[2]) * 0.5)))
+                elif o[0] >= r[2]:
+                    pr = min(pr, max(2, int((o[0] - r[2]) * 0.5)))
+        x1 = max(int((r[0] - pl) * inv), 0)
+        y1 = max(int((r[1] - pt) * inv), 0)
+        x2 = min(int((r[2] + pr) * inv), FW)
+        y2 = min(int((r[3] + pb) * inv), FH)
         p = f"{stem}_b{i}.png"
         # 写盘必须无损：白子判据（描边环采样，暗阈值 <120）对 JPEG 极敏感——
         # 实测同一张图另存 jpg 后白子漏 7/7（q100 也漏 5/7），存 png 漏 0。
-        cv2.imwrite(p, bgr[y1:y2, x1:x2])
+        cv2.imwrite(p, bgr_full[y1:y2, x1:x2])
         out.append(p)
+    # 终检：剔除混进来的文字段落（见 _block_is_grid）。全部被判非棋盘时
+    # 保持原样返回——宁可多切一块让人核对，也不要整页识别不出东西。
+    kept = [p for p in out if _block_is_grid(p)]
+    if kept:
+        for p in out:
+            if p not in kept:
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+        # 重编号，保证文件名连续（下游按 b0/b1/... 展示"第 N 题"）
+        if len(kept) != len(out):
+            for k, old in enumerate(kept):
+                new = f"{stem}_b{k}.png"
+                if old != new:
+                    os.replace(old, new)
+                kept[k] = new
+        out = kept
     return out
 
 

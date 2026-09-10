@@ -508,11 +508,17 @@ def _curve_grid(vline, hline, xs, ys, nseg=6, lim_frac=0.5):
 
 
 def probe_full(photo_path):
-    """整盘路由探测：acf 格距 <35px 视为 19 路全局题。
+    """整盘路由探测：直接试锁 19×19，成功即整盘。
 
-    为什么不用 prep_grid 的行列数路由：整页照的整盘切块上 prep_grid 自己
-    就会检错（实测 19x19 检成 11x10），不可信；格距是物理量，整页拍摄下
-    全局题 17~25px、局部死活题 40px+，分得开。
+    为什么不用 acf 绝对格距（旧版 s<35px）：整页照原先被 split_boards 整体
+    缩到 1600，题块只剩 ~450px、格距 23px，与局部题 40px+ 分得开；改成原
+    分辨率裁剪后题块 1026px、格距 50px，绝对阈值直接失效。而 acf 本身在
+    局部题上也会算出荒谬值（实测手筋题块给出 7px）。
+
+    新判据是尺度无关的：**能不能锁出 19×19 网格**。整盘题必成功（实测
+    三道全局题跨度覆盖图宽 0.88~0.91），局部题（7×9 / 7×11 等）必失败
+    ——网格线根本凑不出 19 路等间距结构。附带校验跨度覆盖率，防止在噪声
+    图里凑出假 19 路。
     返回 (is_full, spacing)。
     """
     bgr = cv2.imread(photo_path)
@@ -524,13 +530,21 @@ def probe_full(photo_path):
         bgr = cv2.resize(bgr, (int(w * sc), int(h * sc)))
     bgr, _ = D._deskew_image(bgr)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
-    bg = cv2.medianBlur(gray, 91)
-    norm = cv2.divide(gray, bg, scale=255)
-    dark = ((gray < float(np.median(gray)) * 0.85) | (norm < 195)).astype(np.uint8)
-    s = acf_period(dark.sum(axis=1).astype(np.float64))
-    if s is None:
+    ggrid = gray.copy()
+    ggrid[D._blue_mask_strong(bgr) > 0] = 255
+    try:
+        det = detect_full(ggrid, 19)
+    except Exception:
         return False, None
-    return bool(s < 35), float(s)
+    if det is None:
+        return False, None
+    xs, ys = det
+    if len(xs) < 19 or len(ys) < 19:
+        return False, None
+    H, W = gray.shape
+    if (xs[-1] - xs[0]) < 0.6 * W or (ys[-1] - ys[0]) < 0.6 * H:
+        return False, None
+    return True, float(np.median(np.diff(xs)))
 
 
 def recognize_full_board(photo_path, n=19):
@@ -568,6 +582,26 @@ def recognize_full_board(photo_path, n=19):
     }
 
 
+def _probe_occluded_style(cand, cross_min=0.5, top=0.10, kmin=5):
+    """探测印刷风格：白子是否把网格线盖住。
+
+    两种风格都真实存在：拍照题册是「线穿白子」（白子处 min(hf,vf)=1.0），
+    PDF 打印稿是「白子盖住线」（实测白子处横线断开、min(hf,vf)=0.11）。
+    后者若强制交点校验，整盘白子会被全部砍成 0（103/79/60 → 0）。
+
+    取 core 最高的一批候选格——它们必然是真白子（已达纸白量级）——看这批
+    格子的 min(hf,vf)：普遍低于 cross_min 说明白子把线盖住了，交点校验
+    不适用。实测：打印稿中位 0.11（100% 低于阈值）、拍照稿中位 1.00
+    （仅 3%~12% 低于），分离干净。
+    输入 cand 为 (ix, iy, cx, cy, core, dark_frac, hv) 列表。
+    """
+    if not cand:
+        return False
+    c = sorted(cand, key=lambda t: -t[4])
+    k = max(kmin, int(len(c) * top))
+    return float(np.median([t[6] for t in c[:k]])) < cross_min
+
+
 def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
                   gray_norm=None, cross_min=0.5, diag=False):
     """整盘专属分类：核心亮度主导 + 自适应阈值 + 交点校验。
@@ -590,6 +624,13 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
        可见（min(hf,vf)>=cross_min）。用 max 不够——实测 b1 右下角 (18,18) 的
        采样点跑到棋盘外，max(hf,vf)=0.57 仍能过闸，min=0.43 才挡得住；而
        真白子处（本册是线穿白子印刷）min 一律 1.0，不受影响。
+    ④b **印刷风格自适应**（2026-09-10）：题册有两种印刷风格——「线穿白子」
+       （拍照题册，白子处 min(hf,vf)=1.0）与「白子盖住线」（PDF 打印稿，
+       实测白子处横线断开、min(hf,vf)=0.11）。后者若强制交点校验，三道整盘
+       题的白子会被全部砍成 0（103/79/60 → 0）。故由 _probe_occluded_style
+       自动探测：取 core 最高的一批格（必是真白子）看其线可见度，判定为
+       「盖住线」风格时整体放开交点校验。不能无条件放开——拍照稿上边框线
+       处的 core 也极亮（实测 b2 (18,1)），放开会放进假白。
     ⑤ 光照归一：core 与阈值都在 gray_norm 上算，避免装订侧阴影误杀白子
        （实测 b1 左下角空格 core 85~153 被全局阈值 166 砍掉）。
     ⑥ 黑子判据不变（dark_frac 与 _big_dark_frac 双条件，实测 0.89~0.98），
@@ -630,8 +671,14 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
                     rows.append((ix, iy, "B", dark_frac, 0.0, 0.0))
                 continue
             core = float(core_map[cy, cx])
+            hv = 1.0
+            if need_cross:
+                hf, vf = D._line_visibility(gray_cls, cx, cy, r_line,
+                                            ix == 0, ix == nx - 1,
+                                            iy == 0, iy == ny - 1)
+                hv = min(hf, vf)
             cores.append(core)
-            cand.append((ix, iy, cx, cy, core, dark_frac))
+            cand.append((ix, iy, cx, cy, core, dark_frac, hv))
     # 自适应阈值：空格众数 → 纸面中位 之间按 gap 取点
     if cores:
         h, e = np.histogram(np.asarray(cores),
@@ -640,18 +687,10 @@ def classify_full(gray_cls, xs, ys, pts=None, need_cross=True, gap=0.70,
         thr = mode + gap * (med - mode)
     else:
         thr = med - 10.0
-    for (ix, iy, cx, cy, core, dark_frac) in cand:
-        hv = 1.0
-        if need_cross:
-            hf, vf = D._line_visibility(gray_cls, cx, cy, r_line,
-                                        ix == 0, ix == nx - 1,
-                                        iy == 0, iy == ny - 1)
-            hv = min(hf, vf)
-            if hv < cross_min:
-                if diag:
-                    rows.append((ix, iy, ".", dark_frac, core, hv))
-                continue
-        is_white = core >= thr
+    # 「白子盖住线」的印刷风格下交点校验不适用，整体放开（见 ④b）
+    gate = need_cross and not _probe_occluded_style(cand, cross_min)
+    for (ix, iy, cx, cy, core, dark_frac, hv) in cand:
+        is_white = core >= thr and (not gate or hv >= cross_min)
         if is_white:
             white.add((ix, iy))
             marks.append((cx, cy, r_line, "W"))

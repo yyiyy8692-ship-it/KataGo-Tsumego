@@ -57,7 +57,14 @@ def ascii_view(gcls, gnorm, pts, i0, i1, j0, j1, width=110):
 def main():
     name = sys.argv[1]
     i0, i1, j0, j1 = (int(v) for v in sys.argv[2:6])
-    bgr = cv2.imread("photos/%s.png" % name)
+    import os
+    for cand in ("photos/%s.png" % name, "review_paper/%s.png_norm.png" % name,
+                 "review_out/%s.png" % name, name):
+        if os.path.exists(cand):
+            bgr = cv2.imread(cand)
+            break
+    else:
+        raise SystemExit("找不到题图: %s" % name)
     bgr, _ = D._deskew_image(bgr)
     gray = cv2.cvtColor(bgr, cv2.COLOR_BGR2GRAY)
     gcls = gray.copy()
