@@ -24,3 +24,4 @@ review_out/
 # 调试中间图（几百 KB~1MB，不入版本库）
 dbg_*.png
 review_paper/
+solution_out/

@@ -114,7 +114,12 @@ class Engine:
                 tn = o.get("turnNumber")
                 if tn is not None:
                     turns[tn] = o
-                    if tn >= n_turns - 1:
+                    # 必须等**全部** turn 到齐再返回：KataGo 多线程分析会乱序
+                    # 返回（实测 numAnalysisThreads=2 时 turns[1] 可能晚于
+                    # turns[3]），原先「收到最后一个就 break」会漏掉前面的，
+                    # 调用方按 turns[k] 取值直接 KeyError（2026-09-10 实测：
+                    # 变化图跑到第5题崩溃）。
+                    if len(turns) >= n_turns:
                         break
             return {"turns": turns, "n_moves": len(moves)}
 
