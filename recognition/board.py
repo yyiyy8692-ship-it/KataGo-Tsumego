@@ -138,9 +138,12 @@ def board_parts(name, black, white, corner, cols=7, rows=9,
                 p.append(f'<circle cx="{cx}" cy="{cy}" r="{r * 1.06:.1f}" '
                          f'fill="none" stroke="{C_MARK}" stroke-width="1.5" '
                          f'opacity="0.45"/>')
-            p.append(f'<text x="{cx}" y="{cy}" font-size="{fs:.0f}" '
-                     f'font-weight="700" fill="{ink}" text-anchor="middle" '
-                     f'dominant-baseline="central" '
+            # 垂直居中：**不要用 dominant-baseline="central"**——浏览器实际按
+            # 字体 em 盒算，数字会整体偏上（2026-09-11 用户指出）。数字高约
+            # 0.7em，视觉中心在基线上方 0.35em，所以把基线 y 下移 0.35em。
+            p.append(f'<text x="{cx}" y="{cy + fs * 0.35:.1f}" '
+                     f'font-size="{fs:.0f}" font-weight="700" fill="{ink}" '
+                     f'text-anchor="middle" '
                      f'font-family="PingFang SC, sans-serif">{sq}</text>')
 
     # 4) 底部小字（排版同参考样图：主标题深色 + 副行与墙同色）

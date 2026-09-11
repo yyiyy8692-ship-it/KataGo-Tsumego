@@ -425,9 +425,10 @@ def variation_single(title, cols, rows, corner, black0, white0, res,
             tail += "（仅%d次访问）" % s["visits"]
         p.append(f'<circle cx="{lx + 13}" cy="{ly - 5}" r="12" '
                  f'fill="{C_MARK}"/>')
-        p.append(f'<text x="{lx + 13}" y="{ly - 5}" font-size="14" '
-                 f'font-weight="700" fill="#FFFFFF" text-anchor="middle" '
-                 f'dominant-baseline="central" '
+        # 同 board.py：不用 dominant-baseline，基线显式下移 0.35em 才真居中
+        p.append(f'<text x="{lx + 13}" y="{ly - 5 + 14 * 0.35:.1f}" '
+                 f'font-size="14" font-weight="700" fill="#FFFFFF" '
+                 f'text-anchor="middle" '
                  f'font-family="PingFang SC, sans-serif">{s["seq"]}</text>')
         # 目差一律黑方视角（KataGo scoreLead 就是这样，见文件头）
         p.append(txt(lx + 34, ly,

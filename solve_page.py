@@ -9,6 +9,7 @@
     python solve_page.py photos/paper_p1_300.png solution_out 5 3000
                                                   ↑depth ↑visits
 """
+import json
 import os
 import sys
 
@@ -72,6 +73,49 @@ def html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
+def render_item(outdir, i, name, cols, rows, corner, black, white, multi,
+                is_global):
+    """把一题的求解结果渲染成 SVG（多解就多张），返回 (paths, items)。
+
+    抽出来是为了 rerender.py 能只重渲染、不重跑引擎（调字号/间距时用）。
+    """
+    sols = multi["solutions"]
+    outs, items = [], []
+    for k, res in enumerate(sols):
+        tag = ""
+        if is_global:
+            tag = " · 最大一手"
+        elif len(sols) > 1:
+            tag = " · 正解%d/%d（%s）" % (k + 1, len(sols), res["best"])
+        title = "第%d题 %s%s" % (i + 1, name, tag)
+        svg = solver.variation_single(title, cols, rows, corner, black, white,
+                                      res)
+        # 标题里的 "正解1/2" 含斜杠，不能进文件名
+        out = os.path.join(
+            outdir, "%s.svg" % title.replace(" ", "_").replace("/", "-"))
+        with open(out, "w", encoding="utf-8") as f:
+            f.write(svg)
+        outs.append(out)
+        items.append((title, svg))
+    return outs, items
+
+
+def dump_cache(outdir, i, name, cols, rows, corner, black, white, multi,
+               is_global):
+    """求解结果落盘，供 rerender.py 复用（solution_out 已被 .gitignore 忽略）。"""
+    d = os.path.join(outdir, "cache")
+    os.makedirs(d, exist_ok=True)
+    p = os.path.join(d, "b%d.json" % i)
+    with open(p, "w", encoding="utf-8") as f:
+        json.dump({"idx": i, "name": name, "cols": cols, "rows": rows,
+                   "corner": corner,
+                   "black": [list(s) for s in black],
+                   "white": [list(s) for s in white],
+                   "is_global": is_global, "multi": multi},
+                  f, ensure_ascii=False)
+    return p
+
+
 def main(src, outdir, depth=5, visits=3000, names=None, only=None, tol=1.0):
     """only: 只做其中几题（0-based 下标列表），调试用。
 
@@ -110,8 +154,7 @@ def main(src, outdir, depth=5, visits=3000, names=None, only=None, tol=1.0):
         for a in multi["alerts"]:
             print("    注意 %s" % a)
 
-        sols = multi["solutions"]
-        for k, res in enumerate(sols):
+        for res in multi["solutions"]:
             for s in res["steps"]:
                 print("    第%d手 %s %-4s 领先%+.1f 增益%+.1f%s [%s vis=%d]"
                       % (s["seq"], s["color"], s["move"], s["lead"], s["gain"],
@@ -121,22 +164,15 @@ def main(src, outdir, depth=5, visits=3000, names=None, only=None, tol=1.0):
                   % (len(res["steps"]), res["final_lead"], res["lead0"]))
             for a in res["alerts"]:
                 print("    注意 %s" % a)
-            tag = ""
-            if is_global:
-                tag = " · 最大一手"
-            elif len(sols) > 1:
-                tag = " · 正解%d/%d（%s）" % (k + 1, len(sols), res["best"])
-            title = "第%d题 %s%s" % (i + 1, name, tag)
-            svg = solver.variation_single(title, cols, rows, c, black, white,
-                                          res)
-            # 标题里的 "正解1/2" 含斜杠，不能进文件名
-            out = os.path.join(
-                outdir, "%s.svg" % title.replace(" ", "_").replace("/", "-"))
-            with open(out, "w", encoding="utf-8") as f:
-                f.write(svg)
-            outs.append(out)
-            items.append((title, svg))
-            print("    -> %s" % out)
+        o, it = render_item(outdir, i, name, cols, rows, c, black, white,
+                            multi, is_global)
+        outs += o
+        items += it
+        for path in o:
+            print("    -> %s" % path)
+        if only is None:
+            dump_cache(outdir, i, name, cols, rows, c, black, white, multi,
+                       is_global)
     print("    -> %s" % write_html(outdir, items))
     return outs
 
