@@ -116,72 +116,61 @@ def _pick(moveInfos, to_play, tough=True):
     return cand["move"], cl, "目差最顽强", int(cand.get("visits", 0))
 
 
-def solve(cols, rows, black, white, to_play="B", depth=4, visits=3000,
-          komi=None, tough=True):
-    """求正解与变化序列。
-
-    **每一手都独立重新搜索**（depth 次查询），不沿上一次搜索的 PV 尾部走。
-    原因（实测 diag_bestmove.py，2026-09-11）：手筋题3 的第 4 手，根节点 PV
-    给 F6，而落子后重新搜索的最优选是 C3 —— PV 越往尾部访问量越低、越不可信。
-    KaTrain / Lizzie 的教学模式同样是逐步重算，不是复用 PV。
-
-    tough: 是否启用「最顽强抵抗」目差校验（详见 _pick）。
-    depth: 变化图要几手（3~5）。返回 dict：
-        best/lead/cands: 初始局面引擎首选、黑方领先目差、前几个候选
-        steps: [{"seq","color","move","xy","black","white","lead","gain",
-                 "captured","criterion","visits"}...]
-        lead0/final_lead: 初始局面 / 走完 depth 手后黑方领先
-        pv: 根节点 PV（用于与逐步搜索结果对照，drift 会进 alerts）
-        alerts: 需要人工留意的提示
-    """
-    komi = _default_komi(cols, rows) if komi is None else komi
-    eng = get_engine()
-    size = (cols, rows)
-
-    board = GoBoard(cols, rows, black, white)
-    cur_b, cur_w = board.stones()
-    pl = to_play
-    steps = []
-
-    # 1) 根查询：候选、PV、初始目差
-    t = eng.query(size, cur_b, cur_w, to_play=pl, max_visits=visits,
+def _root(eng, size, black, white, to_play, visits, komi):
+    """根查询，返回 (turn, moveInfos, lead0)。"""
+    t = eng.query(size, black, white, to_play=to_play, max_visits=visits,
                   komi=komi)["turns"][0]
-    mis0 = move_infos(t, 8)
-    if not mis0:
+    mis = move_infos(t, 8)
+    if not mis:
         raise RuntimeError("引擎没给出任何候选——先核对棋形识别是否合法")
-    cands = [(mi["move"], round(float(mi.get("scoreLead", 0)), 1))
-             for mi in mis0[:6]]
-    best = mis0[0]["move"]
-    best_lead = float(mis0[0].get("scoreLead", 0.0))
-    lead0 = float(t.get("rootInfo", {}).get("scoreLead", best_lead))
-    pv = list(mis0[0].get("pv", []))
+    lead0 = float(t.get("rootInfo", {}).get("scoreLead",
+                                            mis[0].get("scoreLead", 0.0)))
+    return t, mis, lead0
 
-    # 2) 逐手独立搜索
-    for i in range(depth):
-        if i:
-            t = eng.query(size, cur_b, cur_w, to_play=pl, max_visits=visits,
-                          komi=komi)["turns"][0]
-            mis = move_infos(t, 8)
-            if not mis:
-                break
-        else:
-            mis = mis0
+
+def _rollout(eng, size, black, white, to_play, first, depth, visits, komi,
+             tough):
+    """从局面推演到第 depth 手，返回 (steps, (cur_b, cur_w), next_player)。
+
+    **每一手都独立重新搜索**，不沿上一次搜索的 PV 尾部走（实测见 _pick 注释：
+    PV 第 3 手往后与实算经常不一致）。first 是已确定并验证过的第 1 手 step，
+    传 None 表示从原始局面开始逐手自己选。
+    """
+    board = GoBoard(size[0], size[1], black, white)
+    steps, pl = [], to_play
+    if first is not None:
+        board.play(first["color"], *first["xy"])
+        steps.append(dict(first))
+        pl = "W" if first["color"] == "B" else "B"
+    cur_b, cur_w = board.stones()
+    while len(steps) < depth:
+        t = eng.query(size, cur_b, cur_w, to_play=pl, max_visits=visits,
+                      komi=komi)["turns"][0]
+        mis = move_infos(t, 8)
+        if not mis:
+            break
         mv, lead, crit, vis = _pick(mis, pl, tough)
         if mv == "pass":
             break
         x, y = from_gtp(mv)
-        if not (0 <= x < cols and 0 <= y < rows):
+        if not (0 <= x < size[0] and 0 <= y < size[1]):
             break
         removed = board.play(pl, x, y)
-        prev_lead = steps[-1]["lead"] if steps else lead0
         cur_b, cur_w = board.stones()
-        steps.append({"seq": i + 1, "color": pl, "move": mv, "xy": (x, y),
-                      "black": cur_b, "white": cur_w, "lead": lead,
-                      "gain": lead - prev_lead, "captured": len(removed),
-                      "criterion": crit, "visits": vis})
+        prev = steps[-1]["lead"] if steps else lead
+        steps.append({"seq": len(steps) + 1, "color": pl, "move": mv,
+                      "xy": (x, y), "black": cur_b, "white": cur_w,
+                      "lead": lead, "gain": lead - prev,
+                      "captured": len(removed), "criterion": crit,
+                      "visits": vis})
         pl = "W" if pl == "B" else "B"
+    return steps, (cur_b, cur_w), pl
 
-    # 3) 收尾：走完后局面的目差（独立评估一次，比沿用最后一手的估值稳）
+
+def _finish(eng, size, cur_b, cur_w, pl, steps, visits, komi, pv, lead0,
+            cands, kind="local", sol_index=1, n_solutions=1, alt=(),
+            tough=True):
+    """收尾：最终目差 + 各类提示，组装成一份 res。"""
     if steps:
         tf = eng.query(size, cur_b, cur_w, to_play=pl,
                        max_visits=max(visits // 2, 500), komi=komi)["turns"][0]
@@ -190,17 +179,13 @@ def solve(cols, rows, black, white, to_play="B", depth=4, visits=3000,
     else:
         final_lead = lead0
 
-    # 4) 提示：双解、提子、PV 与逐步搜索不一致
     alerts = []
-    if len(cands) >= 2 and abs(cands[0][1] - cands[1][1]) < 1.0:
-        alerts.append(
-            "首选 %s 与次选 %s 只差 %.1f 目 —— 引擎眼里接近双解，"
-            "别把它当唯一正解" % (cands[0][0], cands[1][0],
-                                abs(cands[0][1] - cands[1][1])))
+    # 第 1 手不参与对照：多解时第 2 个解本来就不是 PV 首选，算不上"改判"
     drift = [s for s in steps
-             if pv and s["seq"] - 1 < len(pv) and pv[s["seq"] - 1] != s["move"]]
+             if pv and s["seq"] > 1 and s["seq"] - 1 < len(pv)
+             and pv[s["seq"] - 1] != s["move"]]
     if drift:
-        # 合并成一条：根目录 PV 的后半段本就不可信，逐条报警会刷屏
+        # 合并成一条：根 PV 的后半段本就不可信，逐条报警会刷屏
         alerts.append(
             "第 %s 手与根节点 PV 不同（PV 尾部访问量低，逐步独立搜索后改判：%s）"
             % ("、".join(str(s["seq"]) for s in drift),
@@ -211,9 +196,115 @@ def solve(cols, rows, black, white, to_play="B", depth=4, visits=3000,
                       "与引擎首选不同——讲题时留意这是最大抵抗而非唯一应手")
     if any(s["captured"] for s in steps):
         alerts.append("变化过程中有提子，对照棋盘时留意被提掉的棋子")
-    return {"best": best, "lead": best_lead, "lead0": lead0,
-            "final_lead": final_lead, "cands": cands, "steps": steps,
-            "pv": pv, "alerts": alerts, "tough": tough}
+    if kind == "global":
+        alerts.append("这是实战全局局面，给的是**当前最大的一手**，"
+                      "不存在死活题那种唯一正解")
+    return {"best": steps[0]["move"] if steps else "",
+            "lead": steps[0]["lead"] if steps else lead0,
+            "lead0": lead0, "final_lead": final_lead, "cands": cands,
+            "steps": steps, "pv": pv, "alerts": alerts, "tough": tough,
+            "kind": kind, "sol_index": sol_index,
+            "n_solutions": n_solutions, "alt": list(alt)}
+
+
+def solve(cols, rows, black, white, to_play="B", depth=4, visits=3000,
+          komi=None, tough=True, kind="local"):
+    """单解版：求正解与变化序列。
+
+    kind: "local"（死活/手筋题，出完整变化）| "global"（实战全局题，只出第 1 手）
+    """
+    komi = _default_komi(cols, rows) if komi is None else komi
+    eng = get_engine()
+    size = (cols, rows)
+    depth = 1 if kind == "global" else depth
+
+    _, mis0, lead0 = _root(eng, size, black, white, to_play, visits, komi)
+    cands = [(mi["move"], round(float(mi.get("scoreLead", 0)), 1))
+             for mi in mis0[:6]]
+    pv = list(mis0[0].get("pv", []))
+    steps, (cb, cw), pl = _rollout(eng, size, black, white, to_play, None,
+                                   depth, visits, komi, tough)
+    return _finish(eng, size, cb, cw, pl, steps, visits, komi, pv, lead0,
+                   cands, kind=kind, tough=tough)
+
+
+def solve_multi(cols, rows, black, white, to_play="B", depth=5, visits=3000,
+                komi=None, tough=True, tol=1.0, topk=4):
+    """**多解版**：把引擎眼里等价的正解都找出来，每个正解各出一套变化。
+
+    为什么要单独一套（2026-09-11 用户要求）：死活/手筋题存在双解，只给一个
+    "正解"会让孩子以为另外那手是错的。
+
+    判定办法：对根搜索的前 topk 个候选，**逐个落子后独立做一次同深度的搜索**，
+    用走完该手后的 scoreLead（黑方视角）横向比较，与最优手相差 <= tol 目的
+    都算正解。逐个独立验证而不是直接比根节点 moveInfos 的 scoreLead，是因为
+    后者访问量悬殊（实测 vis=1 的候选能报出离谱目差）。
+
+    返回 {"solutions": [res, ...], "cands", "lead0", "n_solutions", ...}
+    """
+    komi = _default_komi(cols, rows) if komi is None else komi
+    eng = get_engine()
+    size = (cols, rows)
+
+    _, mis0, lead0 = _root(eng, size, black, white, to_play, visits, komi)
+    pv = list(mis0[0].get("pv", []))
+
+    # 1) 逐个候选独立验证：落子后重新搜索，拿该局面的目差
+    tried = []
+    for mi in mis0[:topk]:
+        mv = mi["move"]
+        if mv == "pass":
+            continue
+        x, y = from_gtp(mv)
+        if not (0 <= x < cols and 0 <= y < rows):
+            continue
+        board = GoBoard(cols, rows, black, white)
+        removed = board.play(to_play, x, y)
+        nb, nw = board.stones()
+        other = "W" if to_play == "B" else "B"
+        t = eng.query(size, nb, nw, to_play=other, max_visits=visits,
+                      komi=komi)["turns"][0]
+        lead = float(t.get("rootInfo", {}).get("scoreLead",
+                                               mi.get("scoreLead", 0)))
+        tried.append({"move": mv, "lead": lead, "xy": (x, y),
+                      "captured": len(removed), "visits": int(mi.get("visits", 0)),
+                      "criterion": "引擎首选", "color": to_play,
+                      "black": nb, "white": nw, "seq": 1,
+                      "gain": lead - lead0})
+    if not tried:
+        raise RuntimeError("引擎没给出任何可落子的候选")
+    cands = [(d["move"], round(d["lead"], 1)) for d in tried]
+
+    # 2) 与最优手相差 tol 目以内的都算正解
+    best_lead = max(d["lead"] for d in tried) if to_play == "B" \
+        else min(d["lead"] for d in tried)
+    sols = sorted([d for d in tried if abs(d["lead"] - best_lead) <= tol],
+                  key=lambda d: -d["lead"] if to_play == "B" else d["lead"])
+
+    # 3) 每个正解各推演一套变化
+    out = []
+    for i, s in enumerate(sols):
+        alt = [(d["move"], round(d["lead"], 1)) for j, d in enumerate(sols)
+               if j != i]
+        if depth <= 1:
+            steps, (cb, cw), pl = [s], (s["black"], s["white"]), \
+                ("W" if to_play == "B" else "B")
+        else:
+            steps, (cb, cw), pl = _rollout(eng, size, black, white, to_play,
+                                           s, depth, visits, komi, tough)
+        res = _finish(eng, size, cb, cw, pl, steps, visits, komi, pv, lead0,
+                      cands, kind="local", sol_index=i + 1,
+                      n_solutions=len(sols), alt=alt, tough=tough)
+        out.append(res)
+    return {"solutions": out, "cands": cands, "lead0": lead0,
+            "n_solutions": len(sols), "best": sols[0]["move"],
+            "lead": sols[0]["lead"], "kind": "local",
+            "alerts": ([]
+                       if len(sols) == 1 else
+                       ["本题有 %d 个正解：%s，彼此相差 %.1f 目以内 "
+                        "—— 都是对的，别只认一个"
+                        % (len(sols), " / ".join(d["move"] for d in sols),
+                           abs(sols[0]["lead"] - sols[-1]["lead"]))])}
 
 
 def explain(res, to_play="B"):
@@ -221,12 +312,35 @@ def explain(res, to_play="B"):
     if not res["steps"]:
         return ["引擎未给出变化，无法讲解"]
     s1 = res["steps"][0]
-    out = ["正解：第1手 %s %s，落子后黑方领先 %.1f 目。"
-           % ("黑" if s1["color"] == "B" else "白", s1["move"], s1["lead"])]
-    if len(res["cands"]) >= 2:
-        out.append("次选 %s（%.1f 目），与正解差 %.1f 目。"
-                   % (res["cands"][1][0], res["cands"][1][1],
-                      abs(res["cands"][0][1] - res["cands"][1][1])))
+    cn = "黑" if s1["color"] == "B" else "白"
+    n_sol = res.get("n_solutions", 1)
+    out = []
+    if res.get("kind") == "global":
+        out.append("当前最大一手：第1手 %s %s，落子后黑方领先 %.1f 目。"
+                   % (cn, s1["move"], s1["lead"]))
+        if len(res["cands"]) >= 2:
+            out.append("次选 %s（%.1f 目），与这手差 %.1f 目。"
+                       % (res["cands"][1][0], res["cands"][1][1],
+                          abs(res["cands"][0][1] - res["cands"][1][1])))
+        out.append("全局题是实战局面，这一手是当前最大的一手，不是唯一答案。")
+        return out
+    if n_sol > 1:
+        out.append("正解 %d/%d：第1手 %s %s，落子后黑方领先 %.1f 目。"
+                   % (res.get("sol_index", 1), n_sol, cn, s1["move"],
+                      s1["lead"]))
+        if res.get("alt"):
+            out.append("另一正解 %s（%.1f 目），与本手只差 %.1f 目 —— "
+                       "两解都对，都要会。"
+                       % ("、".join("%s" % m for m, _ in res["alt"]),
+                          res["alt"][0][1],
+                          abs(res["alt"][0][1] - s1["lead"])))
+    else:
+        out.append("正解：第1手 %s %s，落子后黑方领先 %.1f 目。"
+                   % (cn, s1["move"], s1["lead"]))
+        if len(res["cands"]) >= 2:
+            out.append("次选 %s（%.1f 目），与正解差 %.1f 目。"
+                       % (res["cands"][1][0], res["cands"][1][1],
+                          abs(res["cands"][0][1] - res["cands"][1][1])))
     if len(res["steps"]) >= 2:
         s2 = res["steps"][1]
         tag = "" if s2.get("criterion", "引擎首选") == "引擎首选" \
@@ -282,9 +396,17 @@ def variation_single(title, cols, rows, corner, black0, white0, res,
     p = [f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
          f'style="max-width:100%;background:{C_BG}">']
     p.append(txt(pad, 46, title, 22, C_TEXT, True))
-    p.append(txt(pad, 74,
-                 "正解 第1手 %s ｜ %d 步变化 ｜ 目差均为黑方视角，起手领先 %.1f 目"
-                 % (res["best"], len(steps), res["lead"]), 15, C_SUB))
+    if res.get("kind") == "global":
+        sub2 = ("最大一手 %s ｜ 目差均为黑方视角，起手领先 %.1f 目"
+                % (res["best"], res["lead"]))
+    elif res.get("n_solutions", 1) > 1:
+        sub2 = ("正解 %d/%d：%s ｜ %d 步变化 ｜ 起手领先 %.1f 目"
+                % (res.get("sol_index", 1), res["n_solutions"], res["best"],
+                   len(steps), res["lead"]))
+    else:
+        sub2 = ("正解 第1手 %s ｜ %d 步变化 ｜ 目差均为黑方视角，起手领先 %.1f 目"
+                % (res["best"], len(steps), res["lead"]))
+    p.append(txt(pad, 74, sub2, 15, C_SUB))
 
     p.append(f'<g transform="translate({pad},{board_top})">{inner}</g>')
 

@@ -57,8 +57,9 @@ def write_html(outdir, items, title="正解与变化图"):
         f.write("<!DOCTYPE html><html lang=\"zh\"><head><meta charset=\"utf-8\">")
         f.write("<title>%s</title><style>%s</style></head><body>" % (title, css))
         f.write("<h1>%s</h1>" % html_escape(title))
-        f.write("<p class=\"lead\">共 %d 题 ｜ 全部黑先 ｜ "
-                "每格棋盘高亮的是该手落子，副行标注落子后的目差</p>"
+        f.write("<p class=\"lead\">共 %d 张图 ｜ 全部黑先 ｜ "
+                "一张棋盘标出完整变化，序号写在棋子正中央 ｜ "
+                "目差均为黑方视角 ｜ 全局题只给第 1 手，双解题每个正解各一张</p>"
                 % len(items))
         for name, svg in items:
             f.write("<section><h2>%s</h2>%s</section>"
@@ -71,8 +72,11 @@ def html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def main(src, outdir, depth=4, visits=3000, names=None, only=None):
-    """only: 只做其中几题（0-based 下标列表），调试用。"""
+def main(src, outdir, depth=5, visits=3000, names=None, only=None, tol=1.0):
+    """only: 只做其中几题（0-based 下标列表），调试用。
+
+    tol: 两个候选目差相差 <= tol 目就算等价正解（双解一起列出来）。
+    """
     os.makedirs(outdir, exist_ok=True)
     names = names or DEFAULT_NAMES
     stem = os.path.basename(src).rsplit(".", 1)[0]
@@ -89,28 +93,50 @@ def main(src, outdir, depth=4, visits=3000, names=None, only=None):
         cols, rows, black, white, c = recognize(p)
         print("--- 第%d题 %s  %dx%d 黑%d 白%d"
               % (i + 1, name, cols, rows, len(black), len(white)))
-        res = solver.solve(cols, rows, black, white, to_play="B",
-                           depth=depth, visits=visits)
-        print("    正解 %s（黑领先 %.1f 目）  候选 %s"
-              % (res["best"], res["lead"],
-                 "  ".join("%s(%.1f)" % (m, l) for m, l in res["cands"][:3])))
-        for s in res["steps"]:
-            print("    第%d手 %s %-4s 领先%+.1f 增益%+.1f%s [%s vis=%d]"
-                  % (s["seq"], s["color"], s["move"], s["lead"], s["gain"],
-                     " 提%d子" % s["captured"] if s["captured"] else "",
-                     s["criterion"], s["visits"]))
-        print("    走完 %d 手后黑领先 %+.1f 目（起手 %+.1f）"
-              % (len(res["steps"]), res["final_lead"], res["lead0"]))
-        for a in res["alerts"]:
+        # 全局题（19 路实战局面）只给第 1 手；局部题列出全部等价正解
+        is_global = cols >= 15 or c == "FULL"
+        if is_global:
+            print("    题型：全局实战题 → 只出第 1 手")
+            multi = {"solutions": [solver.solve(
+                cols, rows, black, white, to_play="B", depth=1,
+                visits=visits, kind="global")], "alerts": []}
+        else:
+            multi = solver.solve_multi(cols, rows, black, white, to_play="B",
+                                       depth=depth, visits=visits, tol=tol)
+            print("    正解 %d 个：%s"
+                  % (multi["n_solutions"],
+                     " / ".join("%s(%.1f)" % (r["best"], r["lead"])
+                                for r in multi["solutions"])))
+        for a in multi["alerts"]:
             print("    注意 %s" % a)
-        svg = solver.variation_single("第%d题 %s" % (i + 1, name),
-                                      cols, rows, c, black, white, res)
-        out = os.path.join(outdir, "第%d题_%s_变化图.svg" % (i + 1, name))
-        with open(out, "w", encoding="utf-8") as f:
-            f.write(svg)
-        outs.append(out)
-        items.append((name, svg))
-        print("    -> %s" % out)
+
+        sols = multi["solutions"]
+        for k, res in enumerate(sols):
+            for s in res["steps"]:
+                print("    第%d手 %s %-4s 领先%+.1f 增益%+.1f%s [%s vis=%d]"
+                      % (s["seq"], s["color"], s["move"], s["lead"], s["gain"],
+                         " 提%d子" % s["captured"] if s["captured"] else "",
+                         s["criterion"], s["visits"]))
+            print("    走完 %d 手后黑领先 %+.1f 目（起手 %+.1f）"
+                  % (len(res["steps"]), res["final_lead"], res["lead0"]))
+            for a in res["alerts"]:
+                print("    注意 %s" % a)
+            tag = ""
+            if is_global:
+                tag = " · 最大一手"
+            elif len(sols) > 1:
+                tag = " · 正解%d/%d（%s）" % (k + 1, len(sols), res["best"])
+            title = "第%d题 %s%s" % (i + 1, name, tag)
+            svg = solver.variation_single(title, cols, rows, c, black, white,
+                                          res)
+            # 标题里的 "正解1/2" 含斜杠，不能进文件名
+            out = os.path.join(
+                outdir, "%s.svg" % title.replace(" ", "_").replace("/", "-"))
+            with open(out, "w", encoding="utf-8") as f:
+                f.write(svg)
+            outs.append(out)
+            items.append((title, svg))
+            print("    -> %s" % out)
     print("    -> %s" % write_html(outdir, items))
     return outs
 
@@ -118,7 +144,7 @@ def main(src, outdir, depth=4, visits=3000, names=None, only=None):
 if __name__ == "__main__":
     src = sys.argv[1] if len(sys.argv) > 1 else "photos/paper_p1_300.png"
     outdir = sys.argv[2] if len(sys.argv) > 2 else "solution_out"
-    depth = int(sys.argv[3]) if len(sys.argv) > 3 else 4
+    depth = int(sys.argv[3]) if len(sys.argv) > 3 else 5
     visits = int(sys.argv[4]) if len(sys.argv) > 4 else 3000
     only = ([int(v) for v in sys.argv[5].split(",")]
             if len(sys.argv) > 5 else None)
