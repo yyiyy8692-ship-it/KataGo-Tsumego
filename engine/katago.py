@@ -137,6 +137,17 @@ def ownership_grid(resp, board_size):
     return np.array(resp["ownership"], dtype=float).reshape(h, w)[::-1, :]
 
 
+def move_infos(turn_resp, topn=8):
+    """原始 moveInfos（含 visits/winrate/utility/lcb），供选点策略自行比较。
+
+    **排序是 KataGo 自己给的稳健序（LCB，不是裸 scoreLead）**——实测
+    （2026-09-11 diag_bestmove.py）：胜率饱和局面里只被访问 1 次的候选会给出
+    完全失真的 scoreLead（全局题2 白方 K10 lead=+0.27/vis=1，而实算 -9 目），
+    所以按 scoreLead 重排时必须带访问量门槛，否则会挑到噪声手。
+    """
+    return list(turn_resp.get("moveInfos", [])[:topn])
+
+
 def best_moves(turn_resp, topn=6):
     """从某个 turn 的响应提取候选点 [(move, scoreLead, pv), ...]。"""
     return [(mi["move"], round(mi.get("scoreLead", 0), 1), mi.get("pv", []))

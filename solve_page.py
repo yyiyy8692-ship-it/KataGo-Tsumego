@@ -71,7 +71,8 @@ def html_escape(s):
     return (s.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;"))
 
 
-def main(src, outdir, depth=4, visits=3000, names=None):
+def main(src, outdir, depth=4, visits=3000, names=None, only=None):
+    """only: 只做其中几题（0-based 下标列表），调试用。"""
     os.makedirs(outdir, exist_ok=True)
     names = names or DEFAULT_NAMES
     stem = os.path.basename(src).rsplit(".", 1)[0]
@@ -82,6 +83,8 @@ def main(src, outdir, depth=4, visits=3000, names=None):
     print("共 %d 题，depth=%d visits=%d" % (len(parts), depth, visits))
     outs, items = [], []
     for i, p in enumerate(parts):
+        if only is not None and i not in only:
+            continue
         name = names[i] if i < len(names) else "第%d题" % (i + 1)
         cols, rows, black, white, c = recognize(p)
         print("--- 第%d题 %s  %dx%d 黑%d 白%d"
@@ -92,13 +95,16 @@ def main(src, outdir, depth=4, visits=3000, names=None):
               % (res["best"], res["lead"],
                  "  ".join("%s(%.1f)" % (m, l) for m, l in res["cands"][:3])))
         for s in res["steps"]:
-            print("    第%d手 %s %-4s 领先%.1f 增益%+.1f%s"
+            print("    第%d手 %s %-4s 领先%+.1f 增益%+.1f%s [%s vis=%d]"
                   % (s["seq"], s["color"], s["move"], s["lead"], s["gain"],
-                     " 提%d子" % s["captured"] if s["captured"] else ""))
+                     " 提%d子" % s["captured"] if s["captured"] else "",
+                     s["criterion"], s["visits"]))
+        print("    走完 %d 手后黑领先 %+.1f 目（起手 %+.1f）"
+              % (len(res["steps"]), res["final_lead"], res["lead0"]))
         for a in res["alerts"]:
             print("    注意 %s" % a)
-        svg = solver.variation_sheet("第%d题 %s" % (i + 1, name),
-                                     cols, rows, c, black, white, res)
+        svg = solver.variation_single("第%d题 %s" % (i + 1, name),
+                                      cols, rows, c, black, white, res)
         out = os.path.join(outdir, "第%d题_%s_变化图.svg" % (i + 1, name))
         with open(out, "w", encoding="utf-8") as f:
             f.write(svg)
@@ -114,4 +120,6 @@ if __name__ == "__main__":
     outdir = sys.argv[2] if len(sys.argv) > 2 else "solution_out"
     depth = int(sys.argv[3]) if len(sys.argv) > 3 else 4
     visits = int(sys.argv[4]) if len(sys.argv) > 4 else 3000
-    main(src, outdir, depth, visits)
+    only = ([int(v) for v in sys.argv[5].split(",")]
+            if len(sys.argv) > 5 else None)
+    main(src, outdir, depth, visits, only=only)

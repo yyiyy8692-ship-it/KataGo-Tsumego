@@ -43,11 +43,19 @@ def board_svg(name, black, white, corner, cols=7, rows=9,
 
 
 def board_parts(name, black, white, corner, cols=7, rows=9,
-                cell=46, margin=44, mark=None, seq=None, sub=None):
+                cell=46, margin=44, mark=None, seq=None, sub=None,
+                nums=None, last=None):
     """棋盘 SVG 的**内部片段**，返回 (w, h, inner_svg)。
 
     变化图要把多张棋盘拼进一张大图，直接用 board_svg 会得到多个独立 <svg>；
     这里只吐内部内容，由调用方用 <g transform="translate(...)"> 排版。
+
+    nums: [(seq, x, y), ...] —— **多手同图**，序号写在各自棋子的正中央
+        （2026-09-11 用户定稿：变化图不要拆成 5 张小图，就是传统棋书那张
+        「一手一编号」的参考图）。last=(x, y) 标出最后一手（环加粗）。
+        某点上若已无子（中途被提掉），画虚线环 + 珊瑚色数字，避免数字直接
+        浮在空交叉点上看不出那手落在哪。
+    mark/seq: 向后兼容的单手快捷方式，等价于 nums=[(seq, mark)]。
     """
     over = 7                      # 墙线端点出头像素
     w = (cols - 1) * cell + 2 * margin
@@ -103,18 +111,37 @@ def board_parts(name, black, white, corner, cols=7, rows=9,
         p.append(f'<circle cx="{cx}" cy="{cy}" r="{r:.1f}" fill="{C_WHITE}" '
                  f'stroke="{C_WHITE_STROKE}" stroke-width="1.5"/>')
 
-    # 3b) 最新一手：珊瑚色高亮环 + 序号写在棋子中心
-    if mark is not None:
-        mx, my = mark
-        cx, cy = px(mx, my)
-        p.append(f'<circle cx="{cx}" cy="{cy}" r="{r * 0.92:.1f}" fill="none" '
-                 f'stroke="{C_MARK}" stroke-width="3"/>')
-        if seq is not None:
-            ink = C_WHITE if (mx, my) in set(map(tuple, black)) else C_TEXT
-            p.append(f'<text x="{cx}" y="{cy}" font-size="{cell * 0.52:.0f}" '
-                     f'font-weight="600" fill="{ink}" text-anchor="middle" '
+    # 3b) 序号：多手同图时每手一个，数字写在棋子正中央
+    if nums is None and mark is not None:
+        nums, last = [(seq, mark[0], mark[1])], mark
+    if nums:
+        bset = set(map(tuple, black))
+        wset = set(map(tuple, white))
+        lx, ly = last if last is not None else (nums[-1][1], nums[-1][2])
+        for item in nums:
+            sq, mx, my = item[0], item[1], item[2]
+            cx, cy = px(mx, my)
+            is_last = (mx, my) == (lx, ly)
+            on_stone = (mx, my) in bset or (mx, my) in wset
+            if on_stone:
+                p.append(f'<circle cx="{cx}" cy="{cy}" r="{r * 0.92:.1f}" '
+                         f'fill="none" stroke="{C_MARK}" '
+                         f'stroke-width="{4 if is_last else 2.5}"/>')
+                ink = C_WHITE if (mx, my) in bset else C_TEXT
+                fs = cell * (0.44 if len(str(sq)) > 1 else 0.52)
+            else:                      # 该子已被提掉：虚线环 + 珊瑚色数字
+                p.append(f'<circle cx="{cx}" cy="{cy}" r="{r * 0.8:.1f}" '
+                         f'fill="none" stroke="{C_MARK}" stroke-width="2" '
+                         f'stroke-dasharray="4 3"/>')
+                ink, fs = C_MARK, cell * 0.46
+            if is_last:                # 最后一手加一圈浅色光晕，一眼定位
+                p.append(f'<circle cx="{cx}" cy="{cy}" r="{r * 1.06:.1f}" '
+                         f'fill="none" stroke="{C_MARK}" stroke-width="1.5" '
+                         f'opacity="0.45"/>')
+            p.append(f'<text x="{cx}" y="{cy}" font-size="{fs:.0f}" '
+                     f'font-weight="700" fill="{ink}" text-anchor="middle" '
                      f'dominant-baseline="central" '
-                     f'font-family="PingFang SC, sans-serif">{seq}</text>')
+                     f'font-family="PingFang SC, sans-serif">{sq}</text>')
 
     # 4) 底部小字（排版同参考样图：主标题深色 + 副行与墙同色）
     ty = h - 40

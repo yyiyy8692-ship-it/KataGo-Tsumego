@@ -25,7 +25,12 @@
 import html
 
 from recognition.board import board_parts, C_BG, C_TEXT, C_SUB, C_MARK
-from engine.katago import get_engine, best_moves, gtp, from_gtp
+from engine.katago import get_engine, best_moves, move_infos, gtp, from_gtp
+
+
+# 「最强应手」的选点策略（2026-09-11 实测定参，勿凭直觉改）
+MIN_VISITS = 30      # 候选参与目差比较的最低访问量：低于此的 scoreLead 是噪声
+MIN_GAIN = 0.3       # 目差准则要推翻引擎首选，至少得便宜这么多目
 
 
 class GoBoard:
@@ -83,82 +88,132 @@ def _default_komi(cols, rows):
     return 7.5 if min(cols, rows) >= 15 else 0.0
 
 
+def _pick(moveInfos, to_play, tough=True):
+    """从候选里挑一手，返回 (move, lead, criterion, visits)。
+
+    策略（2026-09-11 改，理由见 tests 与 diag_bestmove.py 实测）：
+    1. **默认信引擎首选**。KataGo 的 moveInfos 已按它自己的稳健序（LCB）排好，
+       不是裸 scoreLead 排的。实测胜率饱和局面里，只被访问 1 次的候选会给出
+       离谱的 scoreLead（全局题2 白方 K10：lead=+0.27、vis=1，实算 -9 目），
+       无门槛地按 scoreLead 重排必翻车。
+    2. **tough（最顽强）**：在访问量 >= MIN_VISITS 的候选里，黑取 scoreLead
+       最大、白取最小（= 让黑领先最少，即最顽强的抵抗）。只有比引擎首选便宜
+       >= MIN_GAIN 目才真的替换——差个零点几目说明是搜索噪声，不值得换。
+    3. 这样"讲题用的最强应手"= 引擎最优，且在大胜/大败已定、引擎开始随手时
+       仍能靠目差把它拽回最顽强的一手。
+    """
+    mis = list(moveInfos)
+    first = mis[0]
+    fm, fl = first["move"], float(first.get("scoreLead", 0.0))
+    if not tough or len(mis) == 1:
+        return fm, fl, "引擎首选", int(first.get("visits", 0))
+    pool = [m for m in mis if int(m.get("visits", 0)) >= MIN_VISITS] or [first]
+    want = min if to_play == "W" else max        # 白要让黑领先最少
+    cand = want(pool, key=lambda m: float(m.get("scoreLead", 0.0)))
+    cl = float(cand.get("scoreLead", 0.0))
+    if cand["move"] == fm or abs(cl - fl) < MIN_GAIN:
+        return fm, fl, "引擎首选", int(first.get("visits", 0))
+    return cand["move"], cl, "目差最顽强", int(cand.get("visits", 0))
+
+
 def solve(cols, rows, black, white, to_play="B", depth=4, visits=3000,
-          komi=None):
+          komi=None, tough=True):
     """求正解与变化序列。
 
+    **每一手都独立重新搜索**（depth 次查询），不沿上一次搜索的 PV 尾部走。
+    原因（实测 diag_bestmove.py，2026-09-11）：手筋题3 的第 4 手，根节点 PV
+    给 F6，而落子后重新搜索的最优选是 C3 —— PV 越往尾部访问量越低、越不可信。
+    KaTrain / Lizzie 的教学模式同样是逐步重算，不是复用 PV。
+
+    tough: 是否启用「最顽强抵抗」目差校验（详见 _pick）。
     depth: 变化图要几手（3~5）。返回 dict：
         best/lead/cands: 初始局面引擎首选、黑方领先目差、前几个候选
         steps: [{"seq","color","move","xy","black","white","lead","gain",
-                 "captured"}, ...]，black/white 是该手**落下后**的局面
-        lead0: 初始局面黑方领先
+                 "captured","criterion","visits"}...]
+        lead0/final_lead: 初始局面 / 走完 depth 手后黑方领先
+        pv: 根节点 PV（用于与逐步搜索结果对照，drift 会进 alerts）
         alerts: 需要人工留意的提示
     """
     komi = _default_komi(cols, rows) if komi is None else komi
     eng = get_engine()
+    size = (cols, rows)
 
-    # 1) 初始局面：拿首选与 PV
-    root = eng.query((cols, rows), black, white, to_play=to_play,
-                     max_visits=visits, komi=komi)
-    t0 = root["turns"][0]
-    cands = best_moves(t0, 6)
-    if not cands:
-        raise RuntimeError("引擎没给出任何候选——先核对棋形识别是否合法")
-    best, best_lead, pv = cands[0]
-    lead0 = float(t0.get("rootInfo", {}).get("scoreLead", best_lead))
-
-    # 2) 取前 depth 手，推演每手后的局面
-    seq_moves, plan = [], []
     board = GoBoard(cols, rows, black, white)
+    cur_b, cur_w = board.stones()
     pl = to_play
-    for mv in pv[:depth]:
+    steps = []
+
+    # 1) 根查询：候选、PV、初始目差
+    t = eng.query(size, cur_b, cur_w, to_play=pl, max_visits=visits,
+                  komi=komi)["turns"][0]
+    mis0 = move_infos(t, 8)
+    if not mis0:
+        raise RuntimeError("引擎没给出任何候选——先核对棋形识别是否合法")
+    cands = [(mi["move"], round(float(mi.get("scoreLead", 0)), 1))
+             for mi in mis0[:6]]
+    best = mis0[0]["move"]
+    best_lead = float(mis0[0].get("scoreLead", 0.0))
+    lead0 = float(t.get("rootInfo", {}).get("scoreLead", best_lead))
+    pv = list(mis0[0].get("pv", []))
+
+    # 2) 逐手独立搜索
+    for i in range(depth):
+        if i:
+            t = eng.query(size, cur_b, cur_w, to_play=pl, max_visits=visits,
+                          komi=komi)["turns"][0]
+            mis = move_infos(t, 8)
+            if not mis:
+                break
+        else:
+            mis = mis0
+        mv, lead, crit, vis = _pick(mis, pl, tough)
         if mv == "pass":
             break
         x, y = from_gtp(mv)
         if not (0 <= x < cols and 0 <= y < rows):
             break
-        seq_moves.append((pl, mv))
-        plan.append((pl, mv, x, y))
+        removed = board.play(pl, x, y)
+        prev_lead = steps[-1]["lead"] if steps else lead0
+        cur_b, cur_w = board.stones()
+        steps.append({"seq": i + 1, "color": pl, "move": mv, "xy": (x, y),
+                      "black": cur_b, "white": cur_w, "lead": lead,
+                      "gain": lead - prev_lead, "captured": len(removed),
+                      "criterion": crit, "visits": vis})
         pl = "W" if pl == "B" else "B"
-    if not seq_moves:
-        return {"best": best, "lead": best_lead, "lead0": lead0,
-                "cands": [(m, l) for m, l, _ in cands], "steps": [],
-                "alerts": ["引擎 PV 为空，无法生成变化图"]}
 
-    # 3) 一次查询拿各手的评估：turns[k] = 前 k 手走完后的局面
-    res = eng.query((cols, rows), black, white, moves=seq_moves,
-                    to_play=to_play, max_visits=max(visits // 2, 500),
-                    komi=komi)
-    leads = []
-    for k in range(len(seq_moves) + 1):
-        t = res["turns"].get(k)          # 缺 turn 时不崩，退化成 0
-        leads.append(float(t.get("rootInfo", {}).get("scoreLead", 0.0))
-                     if t else 0.0)
+    # 3) 收尾：走完后局面的目差（独立评估一次，比沿用最后一手的估值稳）
+    if steps:
+        tf = eng.query(size, cur_b, cur_w, to_play=pl,
+                       max_visits=max(visits // 2, 500), komi=komi)["turns"][0]
+        final_lead = float(tf.get("rootInfo", {}).get("scoreLead",
+                                                      steps[-1]["lead"]))
+    else:
+        final_lead = lead0
 
-    steps = []
-    board2 = GoBoard(cols, rows, black, white)
-    for i, (pl_i, mv, x, y) in enumerate(plan):
-        removed = board2.play(pl_i, x, y)
-        bl, wh = board2.stones()
-        steps.append({
-            "seq": i + 1, "color": pl_i, "move": mv, "xy": (x, y),
-            "black": bl, "white": wh,
-            "lead": leads[i + 1], "gain": leads[i + 1] - leads[i],
-            "captured": len(removed),
-        })
-
-    # 4) 双解提示：引擎自己都分不清时不该宣称"唯一正解"
+    # 4) 提示：双解、提子、PV 与逐步搜索不一致
     alerts = []
     if len(cands) >= 2 and abs(cands[0][1] - cands[1][1]) < 1.0:
         alerts.append(
             "首选 %s 与次选 %s 只差 %.1f 目 —— 引擎眼里接近双解，"
             "别把它当唯一正解" % (cands[0][0], cands[1][0],
                                 abs(cands[0][1] - cands[1][1])))
+    drift = [s for s in steps
+             if pv and s["seq"] - 1 < len(pv) and pv[s["seq"] - 1] != s["move"]]
+    if drift:
+        # 合并成一条：根目录 PV 的后半段本就不可信，逐条报警会刷屏
+        alerts.append(
+            "第 %s 手与根节点 PV 不同（PV 尾部访问量低，逐步独立搜索后改判：%s）"
+            % ("、".join(str(s["seq"]) for s in drift),
+               " ".join("第%d手 %s→%s" % (s["seq"], pv[s["seq"] - 1], s["move"])
+                        for s in drift)))
+    if any(s["criterion"] != "引擎首选" for s in steps):
+        alerts.append("变化里有手是按「目差最顽强」选的（图中标 *），"
+                      "与引擎首选不同——讲题时留意这是最大抵抗而非唯一应手")
     if any(s["captured"] for s in steps):
         alerts.append("变化过程中有提子，对照棋盘时留意被提掉的棋子")
     return {"best": best, "lead": best_lead, "lead0": lead0,
-            "cands": [(m, l) for m, l, _ in cands], "steps": steps,
-            "alerts": alerts}
+            "final_lead": final_lead, "cands": cands, "steps": steps,
+            "pv": pv, "alerts": alerts, "tough": tough}
 
 
 def explain(res, to_play="B"):
@@ -174,77 +229,105 @@ def explain(res, to_play="B"):
                       abs(res["cands"][0][1] - res["cands"][1][1])))
     if len(res["steps"]) >= 2:
         s2 = res["steps"][1]
-        out.append("对手最强抵抗是第2手 %s %s，之后黑方领先 %.1f 目。"
+        tag = "" if s2.get("criterion", "引擎首选") == "引擎首选" \
+            else "（按「目差最顽强」选出，非引擎第一选择）"
+        out.append("对手最强抵抗是第2手 %s %s，之后黑方领先 %.1f 目%s。"
                    % ("黑" if s2["color"] == "B" else "白", s2["move"],
-                      s2["lead"]))
+                      s2["lead"], tag))
     out.append("想一想：第1手为什么走这里？如果换个位置，对手会怎么反击？")
     return out
 
 
-def variation_sheet(title, cols, rows, corner, black0, white0, res,
-                    to_play="B", with_original=True):
-    """把「原题 + N 手变化」拼成一张 SVG。
+def variation_single(title, cols, rows, corner, black0, white0, res,
+                     to_play="B"):
+    """**一张**棋盘画完整条变化——传统棋书「参考图」的形式。
 
-    整盘（>=15 路）每排放 2 张，手筋题一排 5 张以内；每张棋盘高亮最新一手
-    并标序号，副行写该手的目差与收益。
+    盘面取**走完最后一手**的棋形，每手棋子的正中央写序号 1..N（2026-09-11
+    用户定稿：不要拆成 N 张小图）。右侧图例列每手的落子方、坐标与该手后的
+    目差；按「目差最顽强」选出的手标 *，提示它并非引擎第一选择。
+    被提掉的子不再画，序号落在空交叉点上时用虚线环标出该手曾落在此处。
     """
     steps = res["steps"]
-    boards = []                                   # [(name, black, white, mark, seq, sub)]
-    if with_original:
-        boards.append(("原题", black0, white0, None, None,
-                       "黑 %d · 白 %d ｜ 黑方领先 %.1f 目"
-                       % (len(black0), len(white0), res["lead0"])))
-    for s in steps:
-        sub = "%s %s ｜ 领先 %.1f 目" % ("黑" if s["color"] == "B" else "白",
-                                        s["move"], s["lead"])
-        if s["captured"]:
-            sub += "（提 %d 子）" % s["captured"]
-        boards.append(("第 %d 手" % s["seq"], s["black"], s["white"],
-                       s["xy"], s["seq"], sub))
+    if steps:
+        fb, fw, last_xy = steps[-1]["black"], steps[-1]["white"], steps[-1]["xy"]
+    else:
+        fb, fw, last_xy = black0, white0, None
+    nums = [(s["seq"], s["xy"][0], s["xy"][1]) for s in steps]
 
     big = cols >= 15
-    cell = 26 if big else 34
-    margin = 30 if big else 36
-    bw, bh, _ = board_parts("x", black0, white0, corner, cols, rows,
-                            cell, margin)
-    per_row = 2 if big else min(len(boards), 5)
-    gap = 28
-    n_row = (len(boards) + per_row - 1) // per_row
+    cell = 30 if big else 38
+    margin = 34 if big else 42
+    sub = ("原题 黑 %d · 白 %d ｜ 共 %d 手 ｜ 走完后黑方领先 %.1f 目"
+           % (len(black0), len(white0), len(steps),
+              res.get("final_lead", res["lead"])))
+    bw, bh, inner = board_parts(title, fb, fw, corner, cols, rows,
+                                cell, margin, nums=nums, last=last_xy, sub=sub)
 
-    head_h = 96
-    note_h = 40 + 26 * len(res.get("alerts", [])) + 26 * 4
-    W = 40 * 2 + per_row * bw + (per_row - 1) * gap
-    H = head_h + 20 + n_row * bh + (n_row - 1) * gap + note_h + 30
+    head_h = 92
+    pad = 40
+    legend_w = 430
+    row_h = 38
+    notes = explain(res, to_play)
+    note_h = 26 * (len(notes) + len(res.get("alerts", []))) + 30
+    board_top = head_h + 14
+    legend_h = 56 + row_h * (len(steps) + 1)
+    W = pad + bw + 34 + legend_w + pad
+    H = board_top + max(bh, legend_h) + note_h + 26
+
+    def txt(x, y, s, size=15, color=C_TEXT, bold=False):
+        w = ' font-weight="600"' if bold else ""
+        return (f'<text x="{x}" y="{y}" font-size="{size}"{w} fill="{color}" '
+                f'font-family="PingFang SC, sans-serif">{html.escape(s)}</text>')
 
     p = [f'<svg viewBox="0 0 {W} {H}" xmlns="http://www.w3.org/2000/svg" '
          f'style="max-width:100%;background:{C_BG}">']
-    p.append(f'<text x="40" y="46" font-size="22" font-weight="600" '
-             f'fill="{C_TEXT}" font-family="PingFang SC, sans-serif">'
-             f'{html.escape(title)}</text>')
-    p.append(f'<text x="40" y="74" font-size="15" fill="{C_SUB}" '
-             f'font-family="PingFang SC, sans-serif">'
-             f'正解 第1手 {html.escape(res["best"])} ｜ '
-             f'{len(steps)} 步变化 ｜ 黑方领先 {res["lead"]:.1f} 目</text>')
+    p.append(txt(pad, 46, title, 22, C_TEXT, True))
+    p.append(txt(pad, 74,
+                 "正解 第1手 %s ｜ %d 步变化 ｜ 目差均为黑方视角，起手领先 %.1f 目"
+                 % (res["best"], len(steps), res["lead"]), 15, C_SUB))
 
-    y0 = head_h + 20
-    for i, (name, bl, wh, mark, seq, sub) in enumerate(boards):
-        r, c = divmod(i, per_row)
-        x = 40 + c * (bw + gap)
-        y = y0 + r * (bh + gap)
-        _, _, inner = board_parts(name, bl, wh, corner, cols, rows,
-                                  cell, margin, mark, seq, sub)
-        p.append(f'<g transform="translate({x},{y})">{inner}</g>')
+    p.append(f'<g transform="translate({pad},{board_top})">{inner}</g>')
 
-    ny = y0 + n_row * bh + (n_row - 1) * gap + 34
-    for line in explain(res, to_play):
-        p.append(f'<text x="40" y="{ny}" font-size="15" fill="{C_TEXT}" '
-                 f'font-family="PingFang SC, sans-serif">'
-                 f'{html.escape(line)}</text>')
+    # 右侧图例
+    lx = pad + bw + 34
+    ly = board_top + 10
+    p.append(txt(lx, ly, "变化顺序", 16, C_TEXT, True))
+    ly += 34
+    for s in steps:
+        tail = ""
+        if s["captured"]:
+            tail += " ｜ 提 %d 子" % s["captured"]
+        if s.get("criterion", "引擎首选") != "引擎首选":
+            tail += " *"
+        if s.get("visits", 0) < 300:      # 搜索不够深，目差估值不稳，标出来
+            tail += "（仅%d次访问）" % s["visits"]
+        p.append(f'<circle cx="{lx + 13}" cy="{ly - 5}" r="12" '
+                 f'fill="{C_MARK}"/>')
+        p.append(f'<text x="{lx + 13}" y="{ly - 5}" font-size="14" '
+                 f'font-weight="700" fill="#FFFFFF" text-anchor="middle" '
+                 f'dominant-baseline="central" '
+                 f'font-family="PingFang SC, sans-serif">{s["seq"]}</text>')
+        # 目差一律黑方视角（KataGo scoreLead 就是这样，见文件头）
+        p.append(txt(lx + 34, ly,
+                     "%s %s ｜ 领先 %+.1f 目%s"
+                     % ("黑" if s["color"] == "B" else "白", s["move"],
+                        s["lead"], tail)))
+        ly += row_h
+    if steps:
+        p.append(txt(lx, ly + 4,
+                     "* = 按「目差最顽强」选出（非引擎第一选择）"
+                     if any(s.get("criterion", "引擎首选") != "引擎首选"
+                            for s in steps)
+                     else "每手均取引擎最优（白方＝最顽强抵抗）",
+                     13, C_SUB))
+
+    # 底部讲解
+    ny = board_top + max(bh, legend_h) + 34
+    for line in notes:
+        p.append(txt(pad, ny, line, 15, C_TEXT))
         ny += 26
     for a in res.get("alerts", []):
-        p.append(f'<text x="40" y="{ny}" font-size="14" fill="{C_MARK}" '
-                 f'font-family="PingFang SC, sans-serif">'
-                 f'注意：{html.escape(a)}</text>')
+        p.append(txt(pad, ny, "注意：" + a, 14, C_MARK))
         ny += 26
     p.append("</svg>")
     return "".join(p)
