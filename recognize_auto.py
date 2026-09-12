@@ -19,14 +19,40 @@ import fullboard as F
 
 
 def recognize_auto(path):
-    """返回 (cols, rows, black, white, corner)。"""
+    """返回 (cols, rows, black, white, corner)。
+
+    **必须问 probe_full，不能只看列数**（2026-09-12 修）：
+    整盘管线在「一页里的小题图」上也会硬锁出一个 19×19 点阵并返回 cols=19，
+    旧写法因此直接把假的整盘结果当成正确答案 —— 微信截图实测报出
+    「19×19 黑 87 白 238」（那个截图真正是 7×9）。probe_full 是尺度无关的
+    路由判据（能否锁 19×19 + 跨度覆盖≥0.6），三张已人工确认的全局题它全给
+    True，误判的截图给 False，正好用来当闸门。
+
+    整盘不是"失败兜底"而是"被证认才用"；局部也识别不出时，最后仍试一次整盘，
+    保证不比旧行为更差。
+    """
+    full_ok = False
     try:
-        r = F.recognize_full_board(path)
-        if r and r.get("cols", 0) >= 15:
-            return (r["cols"], r["rows"], list(r["black"]), list(r["white"]),
-                    "FULL")
+        # probe_full 返回 (is_full, spacing) —— 必须取 [0]，
+        # 直接 bool() 包住元组会恒为 True（非空元组真值），闸门形同虚设
+        full_ok = bool(F.probe_full(path)[0])
     except Exception:
-        pass                                  # 整盘失败是常态，走局部管线即可
-    r = D.recognize(path)
-    c = C.locate(path).get("corner") or "BR"
-    return r["cols"], r["rows"], list(r["black"]), list(r["white"]), c
+        full_ok = False
+    if full_ok:
+        try:
+            r = F.recognize_full_board(path)
+            if r and r.get("cols", 0) >= 15:
+                return (r["cols"], r["rows"], list(r["black"]),
+                        list(r["white"]), "FULL")
+        except Exception:
+            pass                                  # 路由说有，但锁网格失败
+    try:
+        r = D.recognize(path)
+        c = C.locate(path).get("corner") or "BR"
+        return r["cols"], r["rows"], list(r["black"]), list(r["white"]), c
+    except Exception:
+        if full_ok:
+            raise                             # 两边都读不出来，报原来的错
+        r = F.recognize_full_board(path)      # 局部失败，整盘再兜一次
+        return (r["cols"], r["rows"], list(r["black"]), list(r["white"]),
+                "FULL")

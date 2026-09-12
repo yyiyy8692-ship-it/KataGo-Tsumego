@@ -1508,6 +1508,96 @@ def _aliased_lattice(gray, xs, ys, line_cov=0.70, min_frac=0.35):
             or aliased_axis(xs, ys[0], ys[-1], "v"))
 
 
+def _norm_dark(gray):
+    """光照归一后的墨迹掩码：除背景再取阈，抗阴影/渐变。
+
+    medianBlur(91) 估背景照度，除回去把"暗"变成"相对周围的暗"，
+    否则整页偏暗的一角所有像素都算墨。
+    """
+    bg = cv2.medianBlur(gray, 91)
+    norm = cv2.divide(gray, bg, scale=255)
+    return norm < 195
+
+
+def _line_cov(dark, vals, span_lo, span_hi, axis, frac=0.08, min_half=3):
+    """每条线「通体有墨」的比例：沿线的走向逐格看 ±band 内是否有墨。
+
+    返回与 vals 等长的列表。真线应接近 1.0；只有文字/阴影凑出的假线很低。
+    """
+    vals = list(vals)
+    s = float(np.median(np.diff(vals))) if len(vals) > 1 else 20.0
+    half = int(max(min_half, frac * s))
+    out = []
+    for v in vals:
+        v = int(round(v))
+        if axis == "h":          # 横线：沿 x 逐列看
+            band = dark[max(v - half, 0):v + half + 1,
+                        max(int(span_lo), 0):int(span_hi) + 1]
+            out.append(float(band.any(axis=0).mean()) if band.size else 0.0)
+        else:                    # 竖线：沿 y 逐行看
+            band = dark[max(int(span_lo), 0):int(span_hi) + 1,
+                        max(v - half, 0):v + half + 1]
+            out.append(float(band.any(axis=1).mean()) if band.size else 0.0)
+    return out
+
+
+def _drop_empty_lines(gray, xs, ys, min_cov=0.02):
+    """格点净化 ①：删掉"整段跨度内几乎没有任何墨"的线。
+
+    动机（2026-09-12「错题本重排版」实测）：题图外圈的**表格边框**会被并进
+    点阵，detect_grid 再按格距插值补齐中间位置，于是凭空多出几根零墨迹的
+    列/行（实测 10×10 的角部题被撑成 13×11，左边两列落在空白纸面上）。
+    这些交叉点上没有线也没有子，纯白纸面被分类器判成白子 —— 一列假白子
+    （实测白 31 对黑 11，其中 10 个是假的）。
+
+    阈值取 0.02：只要线上还有墨就不动它。真线即使被整行棋子压断也有
+    0.07 以上覆盖率（q4 左列实测），与"一点墨都没有"分得开。
+    """
+    dark = _norm_dark(gray)
+    rx, ry = list(xs), list(ys)
+    for _ in range(4):
+        changed = False
+        if len(rx) > 4:
+            cov = _line_cov(dark, rx, ry[0], ry[-1], "v")
+            keep = [v for v, c in zip(rx, cov) if c >= min_cov]
+            if 4 <= len(keep) < len(rx):
+                rx, changed = keep, True
+        if len(ry) > 4:
+            cov = _line_cov(dark, ry, rx[0], rx[-1], "h")
+            keep = [v for v, c in zip(ry, cov) if c >= min_cov]
+            if 4 <= len(keep) < len(ry):
+                ry, changed = keep, True
+        if not changed:
+            break
+    return rx, ry
+
+
+def _keep_main_lattice(vals, gap_ratio=1.6, min_keep=4):
+    """格点净化 ②：按"间距异常大"把点阵切开，只保留最长的一段。
+
+    专治表格边框那类"本身有墨、但离题图还有 2~3 个格距"的线（覆盖率 1.0，
+    光靠 ① 删不掉）。它插值补齐后与点阵不成等距，留着整盘坐标就多一圈空白。
+    正常棋盘点阵间距均匀 → 只有一段 → 原样返回，不受影响。
+    """
+    vals = sorted(vals)
+    if len(vals) < min_keep + 1:
+        return vals
+    d = np.diff(vals)
+    s = float(np.median(d))
+    if s <= 0:
+        return vals
+    runs, cur = [], [vals[0]]
+    for i, g in enumerate(d):
+        if g > gap_ratio * s:
+            runs.append(cur)
+            cur = [vals[i + 1]]
+        else:
+            cur.append(vals[i + 1])
+    runs.append(cur)
+    best = max(runs, key=len)
+    return best if len(best) >= min_keep else vals
+
+
 def _prune_low_coverage_lines(gray, xs, ys, min_cov=0.15):
     """边缘假线剪枝：从点阵两端向内，砍掉"低覆盖且剪掉更规整"的假行/假列。
 
@@ -1521,25 +1611,10 @@ def _prune_low_coverage_lines(gray, xs, ys, min_cov=0.15):
       剪真线间距几乎不变 → 拒绝。
     只检查两端（junk 只会挂在外围）；剩 <4 行/列停。
     """
-    bg = cv2.medianBlur(gray, 91)
-    norm = cv2.divide(gray, bg, scale=255)
-    dark = norm < 195
+    dark = _norm_dark(gray)
 
     def col_hit_cov(vals, span_lo, span_hi, axis):
-        s = np.median(np.diff(vals)) if len(vals) > 1 else 20
-        half = int(max(3, 0.08 * s))
-        out = []
-        for v in vals:
-            v = int(round(v))
-            if axis == "h":   # 横线：沿 x 逐列看 ±half 内是否有墨
-                band = dark[max(v - half, 0):v + half + 1,
-                            max(int(span_lo), 0):int(span_hi) + 1]
-                out.append(band.any(axis=0).mean() if band.size else 0.0)
-            else:             # 竖线：沿 y 逐行看
-                band = dark[max(int(span_lo), 0):int(span_hi) + 1,
-                            max(v - half, 0):v + half + 1]
-                out.append(band.any(axis=1).mean() if band.size else 0.0)
-        return out
+        return _line_cov(dark, vals, span_lo, span_hi, axis)
 
     def irregularity(vals):
         d = np.diff(sorted(vals))
@@ -1613,6 +1688,9 @@ def prep_grid(photo_path):
         raise ValueError("未检测到棋盘网格，请重拍（正对题图、光线均匀、题图完整入镜）")
     xs, ys, centers = out
     xs, ys = _extend_grid_edges(gray_grid, xs, ys)
+    # 格点净化：删零墨迹的插值线 + 只保留最长的等距段（表格边框会撑出假行列）
+    xs, ys = _drop_empty_lines(gray_grid, xs, ys)
+    xs, ys = _keep_main_lattice(xs), _keep_main_lattice(ys)
     # 网格线吸附：圆心锚定的点阵有系统性偏移（边石子中心偏出+s累积），
     # >10px 时扫描分类采样带套不住真线，邻子描边环进带致白子判空
     xs, ys = _snap_grid_to_lines(gray_grid, xs, ys, centers)
@@ -1645,6 +1723,9 @@ def prep_grid(photo_path):
     # 线覆盖剪枝：标题文字行/照片边缘阴影带能凑出峰位但没有线的墨
     # （一图多题整页 + 合成拼图实测 7x9 被撑成 7x10/7x11，全盘错位）
     xs, ys = _prune_low_coverage_lines(gray_grid, list(xs), list(ys))
+    # 幻影线兜底/剪枝之后可能又带出假行列，再净化一次
+    xs, ys = _drop_empty_lines(gray_grid, xs, ys)
+    xs, ys = _keep_main_lattice(xs), _keep_main_lattice(ys)
     return {
         "bgr": bgr, "gray": gray, "gray_grid": gray_grid, "gray_cls": gray_cls,
         "xs": xs, "ys": ys, "centers": centers,
@@ -1960,6 +2041,33 @@ def _blob_candidates(gray, dark=None):
     return out
 
 
+def _drop_covering_regions(regions):
+    """丢掉「包住了 ≥2 个其它候选框」的并块产物，保留更细的那一层。
+
+    动因（2026-09-12 手机拍题册整页实测）：双尺度核里的 **27px 核**会把相邻题图
+    连成一大块——那台手机的整页照格距只有 17px、题间空隙约 20px，27px 核一膨胀
+    就桥接过去，6 道题并成 1 块，切分只剩 2 题（应 6 题）。
+
+    大核本来是给「线距太宽、11px 核并不动」的稀疏大图兜底的；那种情况下根本
+    不存在更细的候选框，所以这条规则不会误杀它。反过来，一个框能装下两个以上
+    各自独立通过自检的框，它只能是并块产物 —— 一个棋盘只该有一个框。
+
+    必须在 _merge_regions **之前**做：并块产物与细框是重叠的，先merge就被吞了。
+    """
+    def covers(a, b, tol=0.06):
+        w = max(a[2] - a[0], 1)
+        h = max(a[3] - a[1], 1)
+        return (b[0] >= a[0] - tol * w and b[2] <= a[2] + tol * w
+                and b[1] >= a[1] - tol * h and b[3] <= a[3] + tol * h)
+
+    drop = set()
+    for i, a in enumerate(regions):
+        inside = sum(1 for j, b in enumerate(regions) if j != i and covers(a, b))
+        if inside >= 2:
+            drop.add(i)
+    return [r for i, r in enumerate(regions) if i not in drop]
+
+
 def _merge_regions(regions):
     """合并同属一块棋盘的候选框（只并重叠的：双尺度核的重复框、同盘碎片）。
 
@@ -2087,6 +2195,7 @@ def split_boards(photo_path, frac=0.10, min_lines=4):
             regions.append([ex1, ey1, ex2, ey2, min(sx, sy)])
     if os.path.exists(tmp):
         os.remove(tmp)
+    regions = _drop_covering_regions(regions)
     regions = _merge_regions(regions)
 
     # ---- 回退路径：统一格距投票分组（大格距稀疏版面） ----
