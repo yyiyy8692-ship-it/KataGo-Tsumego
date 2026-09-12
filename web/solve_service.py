@@ -1,15 +1,19 @@
-"""答案模式服务层：上传 → 切分 → 识别 → 求解 → 渲染。
+"""答案模式服务层：上传 → 切题识别 → **人工确认** → 点一题算一题。
 
-与 grader 那套「批改模式」的区别：这里**不问题型、不录孩子的下法**，直接
-给正解（双解题给全部正解，全局题只给第 1 手），全部按**黑先**计算。
+与「上传即全算」的旧版区别（2026-09-12 用户要求）：
+    识别完先停住，把每题的棋形画成棋盘图给人核对；确认无误后由用户**手动点
+    某一题**才启动 KataGo。
+两个理由：
+    1. 一页 6 题全算要 4~6 分钟，而用户往往只要其中几题；
+    2. 识别错了还硬算 5 分钟是最浪费的一种失败——先让人看一眼更划算。
 
-对外只有三个函数，Flask 路由层薄薄一层调它：
-    create_task(file, opts) -> tid        # 落盘 + 起后台线程
-    task_view(tid, after)   -> dict       # 任务状态（支持增量取题）
+对外接口（Flask 路由层只做转发）：
+    create_task(file, opts) -> tid      # 落盘 + 后台切分识别（不计算）
+    task_view(tid, have)    -> dict     # 任务状态；have=前端已拿到的题号
+    enqueue(tid, idx)       -> bool     # 请求计算第 idx 题（进串行队列）
 
-为什么要异步 + 轮询：一页 6 题在 KataGo 3000 visits 下要跑 4~6 分钟，
-HTTP 请求不可能挂着等。做法是后台串行跑，每算完一题就把 SVG 写进任务
-状态，前端 1.5 秒轮询一次，算一题出一题。
+计算为什么必须串行：KataGo 单实例 + 神经网络吃满 CPU/GPU，并发只会互相拖慢。
+所以这里用单工作线程 + FIFO 队列，而不是每点一题就开一个线程。
 """
 import json
 import os
@@ -35,11 +39,13 @@ MAX_PAGES = 20         # PDF 最多处理的页数
 PDF_DPI = 300          # 与实测样本 photos/paper_p1_300.png 一致
 
 TASKS = {}
-# KataGo 单实例 + 神经网络吃满 CPU/GPU：任务必须串行，并发只会互相拖慢
-_RUN_LOCK = threading.Lock()
+_QUEUE = []            # [(tid, idx)] —— 待计算的题，FIFO
+_QCV = threading.Condition()
 
 IMAGE_EXT = (".jpg", ".jpeg", ".png", ".bmp", ".webp", ".heic", ".heif",
              ".tif", ".tiff")
+
+# 题的几个状态：detected（已识别待确认）→ queued → running → done / error
 
 
 # ---------------------------------------------------------------- 输入归一化
@@ -101,13 +107,8 @@ def _is_pdf(path):
 
 
 # ---------------------------------------------------------------- 任务
-def _progress(t, stage, **kw):
-    t["stage"] = stage
-    t.update(kw)
-
-
 def create_task(file_storage, opts=None):
-    """接收上传文件，落盘并返回 tid（后台线程随即开跑）。"""
+    """接收上传文件，落盘并起「识别」线程（**不会**自动开算）。"""
     opts = opts or {}
     tid = uuid.uuid4().hex[:10]
     d = os.path.join(UPLOADS, tid)
@@ -119,52 +120,56 @@ def create_task(file_storage, opts=None):
     t = {"tid": tid, "dir": d, "src_name": name,
          "created": datetime.now().strftime("%Y-%m-%d %H:%M"),
          "status": "running", "stage": "正在读取文件",
-         "total": 0, "solved": 0, "boards": [], "error": None,
-         "opts": opts, "kind": None}
+         "total": 0, "solved": 0, "pending": 0, "boards": [], "error": None,
+         "opts": opts, "kind": None, "notes": []}
     TASKS[tid] = t
-    threading.Thread(target=_run, args=(tid,), daemon=True).start()
+    threading.Thread(target=_run_detect, args=(tid,), daemon=True).start()
     return tid
 
 
-def task_view(tid, after=0):
+def task_view(tid, have=()):
     """给前端的任务视图。
 
-    after: 前端已完整收到的题数。只回传 idx >= after 的题，避免每次轮询都
-    重发上百 KB 的 SVG。
+    have: 前端**已经拿到答案**的题号集合。这些题不再回传 solutions（一张变化图
+    上百 KB，每次轮询重发纯属浪费）；棋形确认图同样略过。刷新页面时前端状态
+    清空，自然变成全量拉取。
     """
     t = TASKS.get(tid)
     if not t:
         return None
+    have = set(have)
+    boards = []
+    for b in t["boards"]:
+        d = {k: v for k, v in b.items() if not k.startswith("_")}
+        if b["idx"] in have:
+            d.pop("solutions", None)
+            d.pop("check_svg", None)
+        boards.append(d)
     return {"tid": tid, "src_name": t["src_name"], "created": t["created"],
             "status": t["status"], "stage": t["stage"], "kind": t["kind"],
-            "total": t["total"], "solved": t["solved"], "error": t["error"],
-            "boards": [b for b in t["boards"] if b["idx"] >= after]}
+            "total": t["total"], "solved": t["solved"],
+            "pending": t["pending"], "error": t["error"],
+            "notes": t.get("notes", []), "boards": boards}
 
 
-def _run(tid):
-    """后台管线。**串行**：多个用户同时提交时排队，互不拖慢。"""
+def _run_detect(tid):
     t = TASKS[tid]
-    with _RUN_LOCK:
-        try:
-            _pipeline(t)
-            t["status"] = "done"
-            t["stage"] = "完成"
-        except Exception as e:                      # 任何异常都要落到任务里
-            t["status"] = "error"
-            t["error"] = "%s: %s" % (type(e).__name__, e)
-            t["stage"] = "出错"
-            traceback.print_exc()
+    try:
+        _detect(t)
+        t["status"] = "ready"
+        t["stage"] = "识别完成"
+    except Exception as e:                      # 任何异常都要落到任务里
+        t["status"] = "error"
+        t["error"] = "%s: %s" % (type(e).__name__, e)
+        t["stage"] = "出错"
+        traceback.print_exc()
 
 
-def _pipeline(t):
+def _detect(t):
+    """切分 + 识别。**不碰 KataGo**——这一步只回答「有几题、棋形长什么样」。"""
     from recognition.detect import split_boards
     from recognize_auto import recognize_auto as recognize
-    import solver as S
-
-    opts = t["opts"]
-    depth = int(opts.get("depth", 5))
-    visits = int(opts.get("visits", 3000))
-    tol = float(opts.get("tol", 1.0))
+    from recognition.board import board_svg as diagram
 
     _progress(t, "正在解析文件")
     pages, kind, n_pages = prepare_pages(
@@ -173,7 +178,6 @@ def _pipeline(t):
     t["kind"] = kind
     t["pages"] = n_pages
 
-    # 先切分，好让前端早点知道有几题（"第 2/6 题"比转圈有信息量）
     _progress(t, "正在切分题图")
     jobs = []                                   # [(page_no, crop_path)]
     for p, pno in pages:
@@ -181,7 +185,7 @@ def _pipeline(t):
             crops = split_boards(p)
         except Exception as e:
             crops = [p]                         # 切分失败当作整页一题处理
-            t.setdefault("split_note", []).append(
+            t["notes"].append(
                 "第%d页切分失败（%s），按整页一题识别" % (pno, e))
         for cp in crops:
             jobs.append((pno, cp))
@@ -190,31 +194,102 @@ def _pipeline(t):
         raise ValueError("没有检测到任何题图——请正对题目重拍，或换 PDF")
 
     for i, (pno, cp) in enumerate(jobs):
-        _progress(t, "第 %d/%d 题：识别棋形" % (i + 1, len(jobs)))
-        b = {"idx": i, "page": pno, "status": "running",
+        _progress(t, "正在识别第 %d/%d 题" % (i + 1, len(jobs)))
+        b = {"idx": i, "page": pno, "status": "detected",
              "crop_url": "/file/%s/%s" % (t["tid"], os.path.basename(cp))}
-        t["boards"].append(b)
         try:
             cols, rows, black, white, corner = recognize(cp)
         except Exception as e:
-            b["status"] = "error"
-            b["error"] = "识别失败：%s" % e
-            t["solved"] += 1
+            b.update(status="error", error="识别失败：%s" % e)
+            t["boards"].append(b)
             continue
-        b.update(cols=cols, rows=rows, n_black=len(black), n_white=len(white),
-                 corner=corner)
         if len(black) + len(white) == 0:
-            b["status"] = "error"
-            b["error"] = "没识别到任何棋子——请对准题目重拍，或换清晰的 PDF"
-            t["solved"] += 1
+            b.update(status="error",
+                     error="没识别到任何棋子——请对准题目重拍，或换清晰的 PDF")
+            t["boards"].append(b)
             continue
 
         is_global = cols >= 15 or corner == "FULL"
-        b["is_global"] = is_global
         label = "第%d题" % (i + 1) + ("（全局实战题）" if is_global else "")
-        b["label"] = label
+        b.update(cols=cols, rows=rows, corner=corner,
+                 n_black=len(black), n_white=len(white),
+                 is_global=is_global, label=label,
+                 check_svg=diagram(
+                     label, black, white, corner, cols, rows,
+                     sub="%d×%d ｜ 黑 %d · 白 %d" % (cols, rows, len(black),
+                                                    len(white))))
+        # 棋子坐标留在服务端：等用户点了才用，不必下发
+        b["_st"] = ([list(s) for s in black], [list(s) for s in white])
+        t["boards"].append(b)
 
-        _progress(t, "第 %d/%d 题：KataGo 计算" % (i + 1, len(jobs)))
+    t["solved"] = sum(1 for x in t["boards"] if x["status"] == "error")
+
+
+def _progress(t, stage, **kw):
+    t["stage"] = stage
+    t.update(kw)
+
+
+# ---------------------------------------------------------------- 计算队列
+def enqueue(tid, idx):
+    """把第 idx 题放进计算队列。只有 detected 状态的题能被点。"""
+    t = TASKS.get(tid)
+    if not t:
+        return False
+    if not (0 <= idx < len(t["boards"])):
+        return False
+    b = t["boards"][idx]
+    with _QCV:
+        if b["status"] != "detected" or (tid, idx) in _QUEUE:
+            return False
+        b["status"] = "queued"
+        _QUEUE.append((tid, idx))
+        t["pending"] = sum(1 for x in t["boards"]
+                           if x["status"] in ("queued", "running"))
+        _QCV.notify()
+    return True
+
+
+def _worker():
+    """单工作线程：一次只算一题（KataGo 单实例，并发只会互相拖慢）。"""
+    while True:
+        with _QCV:
+            while not _QUEUE:
+                _QCV.wait()
+            tid, idx = _QUEUE.pop(0)
+        try:
+            _solve_one(tid, idx)
+        except Exception:
+            traceback.print_exc()
+
+
+def _set_pending(t):
+    t["pending"] = sum(1 for x in t["boards"]
+                       if x["status"] in ("queued", "running"))
+
+
+def _solve_one(tid, idx):
+    import solver as S
+
+    t = TASKS.get(tid)
+    if not t:
+        return
+    b = t["boards"][idx]
+    with _QCV:
+        b["status"] = "running"
+        _set_pending(t)
+    t["stage"] = "正在计算第 %d 题" % (idx + 1)
+    black, white = b["_st"]
+    black = [tuple(s) for s in black]
+    white = [tuple(s) for s in white]
+    cols, rows, corner = b["cols"], b["rows"], b["corner"]
+    is_global = b["is_global"]
+    opts = t["opts"]
+    depth = int(opts.get("depth", 5))
+    visits = int(opts.get("visits", 3000))
+    tol = float(opts.get("tol", 1.0))
+
+    try:
         if is_global:
             multi = {"solutions": [S.solve(cols, rows, black, white,
                                            to_play="B", depth=1,
@@ -223,9 +298,6 @@ def _pipeline(t):
         else:
             multi = S.solve_multi(cols, rows, black, white, to_play="B",
                                   depth=depth, visits=visits, tol=tol)
-
-        # 立刻渲染：算完一题前端就能看到一题
-        _progress(t, "第 %d/%d 题：出图" % (i + 1, len(jobs)))
         sols = multi["solutions"]
         items = []
         for k, res in enumerate(sols):
@@ -233,8 +305,8 @@ def _pipeline(t):
                 " · 正解%d/%d（%s）" % (k + 1, len(sols), res["best"])
                 if len(sols) > 1 else "")
             items.append({
-                "title": label + tag,
-                "svg": S.variation_single(label + tag, cols, rows, corner,
+                "title": b["label"] + tag,
+                "svg": S.variation_single(b["label"] + tag, cols, rows, corner,
                                           black, white, res),
                 "best": res["best"], "lead": res.get("lead"),
                 "final_lead": res.get("final_lead"),
@@ -246,15 +318,27 @@ def _pipeline(t):
         b.update(status="done", lead0=multi.get("lead0"),
                  solutions=items, n_solutions=len(sols),
                  cands=[list(c) for c in multi.get("cands", [])])
-        t["solved"] += 1
-
-        _cache(os.path.join(t["dir"], "cache"), i, dict(
-            idx=i, label=label, cols=cols, rows=rows, corner=corner,
+        _cache(os.path.join(t["dir"], "cache"), idx, dict(
+            idx=idx, label=b["label"], cols=cols, rows=rows, corner=corner,
             black=[list(s) for s in black], white=[list(s) for s in white],
             is_global=is_global, items=items))
+    except Exception as e:
+        b.update(status="error", error="计算失败：%s: %s" % (type(e).__name__, e))
+        traceback.print_exc()
+
+    with _QCV:
+        _set_pending(t)
+        t["solved"] = sum(1 for x in t["boards"]
+                          if x["status"] in ("done", "error"))
+        t["stage"] = ("全部完成（%d/%d）" % (t["solved"], t["total"])
+                      if not t["pending"] else
+                      "还剩 %d 题在计算" % t["pending"])
 
 
 def _cache(d, i, payload):
     os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "b%d.json" % i), "w", encoding="utf-8") as f:
         json.dump(payload, f, ensure_ascii=False)
+
+
+threading.Thread(target=_worker, daemon=True).start()

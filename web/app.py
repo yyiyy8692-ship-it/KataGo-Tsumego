@@ -57,9 +57,14 @@ def grade_page():
 
 
 # ----------------------------------------------------------- 答案模式 API
-@app.route("/api/solve", methods=["POST"])
-def api_solve():
-    """上传一张照片或一份 PDF，起一个后台任务。
+@app.route("/api/detect", methods=["POST"])
+@app.route("/api/solve", methods=["POST"])          # 旧入口，等价
+def api_detect():
+    """上传一张照片或一份 PDF，**只做切分 + 识别**，不出答案。
+
+    识别完把每题的棋形画出来交给用户核对，用户点哪题才算哪题
+    （见 /api/board/<tid>/<idx>）。一页 6 题全算要 4~6 分钟，而多数时候
+    只要其中几题；识别错了还硬算是最浪费的一种失败。
 
     全部按**黑先**计算（老师给的题册默认如此），暂不开放走棋方选项——
     绝大部分题册印刷的就是黑先，加个开关只会多一处容易误操作的入口。
@@ -81,15 +86,45 @@ def api_solve():
 
 @app.route("/api/task/<tid>")
 def api_task(tid):
-    """任务状态。?after=N 只回传第 N 题之后的（前端增量接收，省流量）。"""
-    try:
-        after = int(request.args.get("after", 0))
-    except ValueError:
-        after = 0
-    v = solve_service.task_view(tid, after)
+    """任务状态。
+
+    ?have=0,2,3 告诉服务端「这几题的答案我已经拿到了」，服务端就不再回传
+    它们的变化图（一张上百 KB，每次轮询重发纯属浪费）。
+    """
+    raw = request.args.get("have", "")
+    have = []
+    for s in raw.split(","):
+        s = s.strip()
+        if s.isdigit():
+            have.append(int(s))
+    v = solve_service.task_view(tid, have)
     if v is None:
         return jsonify({"error": "任务不存在或已过期"}), 404
     return jsonify(v)
+
+
+@app.route("/api/board/<tid>/<int:idx>", methods=["POST"])
+def api_solve_board(tid, idx):
+    """用户点「计算答案」：把这一题放进计算队列（串行，先点先算）。"""
+    if solve_service.task_view(tid) is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    if not solve_service.enqueue(tid, idx):
+        return jsonify({"error": "这一题不能计算（还没识别好，或已经在算）"}), 409
+    return jsonify({"ok": True, "idx": idx})
+
+
+@app.route("/api/board/<tid>/all", methods=["POST"])
+def api_solve_all(tid):
+    """一次性把当前所有待确认的题都排进队列。"""
+    j = request.get_json(silent=True) or {}
+    want = j.get("idx")
+    v = solve_service.task_view(tid)
+    if v is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    if want is None:
+        want = [b["idx"] for b in v["boards"] if b["status"] == "detected"]
+    ok = [i for i in want if solve_service.enqueue(tid, int(i))]
+    return jsonify({"ok": True, "queued": ok})
 
 
 @app.route("/solve/<tid>")

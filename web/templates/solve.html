@@ -16,14 +16,14 @@
 <body data-tid="{{ tid or '' }}">
 <header>
   <h1>围棋死活题 · 答案</h1>
-  <div class="sub">拍照 / 相册 / PDF → 自动切题 → KataGo 出正解，全部按黑先计算</div>
+  <div class="sub">拍照 / 相册 / PDF → 先切题识别 → 逐题核对 → 点哪题算哪题，全部按黑先</div>
 </header>
 
 <div class="card" id="upload-card">
   <h2>选一张题图</h2>
   <p class="tip">
     三种方式都可以：直接拍题目、从相册选已有的照片、或上传老师发的 PDF。
-    一页多题会自动切开，逐题给答案。
+    一页多题会自动切开——<b>先给你看切出来几题、棋形对不对，确认后点哪题才算哪题</b>。
   </p>
 
   <div class="entry-row">
@@ -44,7 +44,7 @@
   <div id="preview-box" class="hidden">
     <img id="preview" class="preview" alt="待处理的题图">
     <div class="row">
-      <button class="primary" id="go">开始计算</button>
+      <button class="primary" id="go">开始识别</button>
       <button class="ghost" id="cancel">重选</button>
     </div>
   </div>
@@ -84,7 +84,13 @@
     <span id="prog-count" class="mono"></span>
   </div>
   <div class="bar"><div id="prog-fill"></div></div>
-  <p class="tip" id="prog-tip">一题约 30~60 秒，不用停在这个页面——复制链接过会儿回来看也行。</p>
+  <p class="tip" id="prog-tip">识别只要几秒；点「算答案」后一题约 30~60 秒，
+    不用停在这个页面——复制链接过会儿回来看也行。</p>
+
+  <div id="confirm-bar" class="hidden">
+    <span id="ready-text"></span>
+    <button class="primary inline" id="solve-all">全部计算</button>
+  </div>
 </div>
 
 <div id="err" class="card hidden alert-box"></div>

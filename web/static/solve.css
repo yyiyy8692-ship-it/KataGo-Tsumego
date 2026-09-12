@@ -26,6 +26,29 @@ header .sub { font-size: 12px; opacity: .75; }
 
 .alert-box { background: #fdecea; border: 1px solid #c0392b; color: #8f2b20; font-size: 14px; }
 
+/* 确认区：识别完成后亮出「全部计算」 */
+#confirm-bar {
+  display: flex; align-items: center; gap: 12px; flex-wrap: wrap;
+  margin-top: 14px; padding-top: 12px; border-top: 1px dashed #d8cbb0;
+}
+#ready-text { flex: 1; font-size: 14px; font-weight: 600; color: #5F4A2A; }
+.primary.inline { display: inline-block; width: auto; margin-top: 0; padding: 10px 18px; }
+
+/* 单题操作区 */
+.act { display: flex; gap: 10px; align-items: stretch; }
+.act .primary { flex: 2; }
+.act .ghost { flex: 1; margin-top: 12px; }
+.waitline {
+  display: flex; align-items: center; gap: 10px; font-size: 14px;
+  color: #6a5a3a; background: #fdf6e3; border-radius: 8px; padding: 10px 12px;
+  margin-top: 10px;
+}
+.spinner.small {
+  width: 16px; height: 16px; border-width: 2px; margin-bottom: 0; flex: none;
+}
+.tag.wait { background: #e8f0e6; color: #3b6b2f; }
+.tag.ok { background: #e3edf7; color: #2c4e72; }
+
 .pb { background: #fff; margin: 14px; padding: 14px 16px; border-radius: 12px;
       box-shadow: 0 1px 4px rgba(0,0,0,.08); }
 .pb-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
