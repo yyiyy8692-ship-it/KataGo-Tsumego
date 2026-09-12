@@ -1,0 +1,9 @@
+{
+  "name": "围棋死活题答案",
+  "short_name": "死活题",
+  "start_url": "/",
+  "display": "standalone",
+  "background_color": "#26221C",
+  "theme_color": "#26221C",
+  "icons": [{"src": "/static/icon-180.png", "sizes": "180x180", "type": "image/png"}]
+}

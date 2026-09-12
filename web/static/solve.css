@@ -1,0 +1,56 @@
+/* 答案模式专用样式（基础样式在 style.css） */
+header .sub { font-size: 12px; opacity: .75; }
+.mono { font-variant-numeric: tabular-nums; }
+.hidden { display: none !important; }
+
+.entry-row { display: flex; gap: 10px; margin: 4px 0 12px; }
+.entry {
+  flex: 1; text-align: center; padding: 16px 4px; cursor: pointer;
+  border: 2px dashed #b8a67a; border-radius: 12px; background: #fffdf7;
+}
+.entry:active { background: #f5eddb; }
+.entry .ico { display: block; font-size: 26px; line-height: 1.2; }
+.entry .t { font-size: 15px; font-weight: 600; }
+.entry input { display: none; }
+
+#adv summary { font-size: 14px; color: #6a5a3a; cursor: pointer; padding: 6px 0; }
+.adv-body label { display: block; font-size: 13px; margin: 8px 0; color: #555; }
+.adv-body select {
+  display: block; width: 100%; margin-top: 4px; padding: 9px;
+  border: 1px solid #d8cbb0; border-radius: 8px; font-size: 15px; background: #fff;
+}
+
+.prog-top { display: flex; justify-content: space-between; font-size: 14px; margin-bottom: 8px; }
+.bar { height: 8px; background: #e6dcc6; border-radius: 5px; overflow: hidden; }
+#prog-fill { height: 100%; width: 0; background: #26221C; transition: width .4s; }
+
+.alert-box { background: #fdecea; border: 1px solid #c0392b; color: #8f2b20; font-size: 14px; }
+
+.pb { background: #fff; margin: 14px; padding: 14px 16px; border-radius: 12px;
+      box-shadow: 0 1px 4px rgba(0,0,0,.08); }
+.pb-head { display: flex; align-items: baseline; gap: 8px; flex-wrap: wrap; }
+.pb-head h2 { font-size: 16px; margin: 0; }
+.tag { font-size: 11px; padding: 2px 8px; border-radius: 10px; background: #efe8da; color: #6a5a3a; }
+.tag.global { background: #e3edf7; color: #2c4e72; }
+.tag.multi { background: #fde9c8; color: #8a5a10; }
+.meta { font-size: 12px; color: #888; margin: 6px 0 2px; }
+.lead-line { font-size: 15px; font-weight: 600; margin: 8px 0 10px; }
+.explain { font-size: 14px; line-height: 1.9; background: #fdf6e3; padding: 10px 12px;
+           border-radius: 8px; margin-top: 10px; }
+.explain div { margin: 2px 0; }
+.alerts { margin-top: 10px; }
+.alerts div { font-size: 13px; line-height: 1.6; color: #8f2b20; background: #fdecea;
+              border: 1px solid #f0c7c2; border-radius: 8px; padding: 8px 10px; margin-bottom: 6px; }
+.pb.error { border: 1px solid #c0392b; }
+.pb .orig { margin-top: 10px; }
+.pb .orig summary { font-size: 13px; color: #6a5a3a; cursor: pointer; }
+.pb .orig img { width: 100%; border-radius: 8px; margin-top: 8px; }
+.board-wrap svg { max-width: 100%; }
+
+footer { text-align: center; padding: 8px 16px 30px; }
+footer .link { color: #6a5a3a; font-size: 13px; display: inline-block; margin-bottom: 6px; }
+
+@media (prefers-color-scheme: dark) and (min-width: 900px) {
+  /* 暗色主题下仅放宽桌面观感，SVG 本身自带纸色底，不跟着变 */
+  body { background: #1c1a16; }
+}

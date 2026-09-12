@@ -15,6 +15,7 @@ import config
 from recognition.detect import recognize, split_boards
 from recognition.render import board_svg
 from grader.grader import grade, hints_for, PROBLEM_TYPES
+from web import solve_service   # 答案模式服务层（异步任务与求解管线）
 
 BASE = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPLOADS = os.path.join(BASE, "uploads")
@@ -42,10 +43,61 @@ def _save(sid, data):
 
 @app.route("/")
 def index():
+    """答案模式（默认）：拍图 / 相册 / PDF 三入口，直接出正解。"""
+    return render_template("solve.html")
+
+
+@app.route("/grade")
+def grade_page():
+    """批改模式（旧 session 流程）：要选题型、录孩子的下法。"""
     import json as _json
     return render_template("index.html", ptypes=PROBLEM_TYPES,
                            ptypes_json=_json.dumps(
                                {k: v[2] for k, v in PROBLEM_TYPES.items()}))
+
+
+# ----------------------------------------------------------- 答案模式 API
+@app.route("/api/solve", methods=["POST"])
+def api_solve():
+    """上传一张照片或一份 PDF，起一个后台任务。
+
+    全部按**黑先**计算（老师给的题册默认如此），暂不开放走棋方选项——
+    绝大部分题册印刷的就是黑先，加个开关只会多一处容易误操作的入口。
+    """
+    f = request.files.get("file")
+    if not f or not f.filename:
+        return jsonify({"error": "没有收到文件"}), 400
+    opts = {
+        "depth": int(request.form.get("depth", 5)),
+        "visits": int(request.form.get("visits", 3000)),
+        "tol": float(request.form.get("tol", 1.0)),
+    }
+    try:
+        tid = solve_service.create_task(f, opts)
+    except Exception as e:
+        return jsonify({"error": "上传失败：%s" % e}), 400
+    return jsonify({"tid": tid})
+
+
+@app.route("/api/task/<tid>")
+def api_task(tid):
+    """任务状态。?after=N 只回传第 N 题之后的（前端增量接收，省流量）。"""
+    try:
+        after = int(request.args.get("after", 0))
+    except ValueError:
+        after = 0
+    v = solve_service.task_view(tid, after)
+    if v is None:
+        return jsonify({"error": "任务不存在或已过期"}), 404
+    return jsonify(v)
+
+
+@app.route("/solve/<tid>")
+def solve_page(tid):
+    """结果页（可刷新、可分享链接）。"""
+    if solve_service.task_view(tid) is None:
+        abort(404)
+    return render_template("solve.html", tid=tid)
 
 
 def _board_ctx(sess, j):

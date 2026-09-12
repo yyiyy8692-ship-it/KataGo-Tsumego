@@ -1,0 +1,105 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<meta name="apple-mobile-web-app-title" content="死活题答案">
+<meta name="theme-color" content="#26221C">
+<link rel="manifest" href="/static/manifest.json">
+<link rel="apple-touch-icon" href="/static/icon-180.png">
+<title>围棋死活题 · 答案</title>
+<link rel="stylesheet" href="/static/style.css">
+<link rel="stylesheet" href="/static/solve.css">
+</head>
+<body data-tid="{{ tid or '' }}">
+<header>
+  <h1>围棋死活题 · 答案</h1>
+  <div class="sub">拍照 / 相册 / PDF → 自动切题 → KataGo 出正解，全部按黑先计算</div>
+</header>
+
+<div class="card" id="upload-card">
+  <h2>选一张题图</h2>
+  <p class="tip">
+    三种方式都可以：直接拍题目、从相册选已有的照片、或上传老师发的 PDF。
+    一页多题会自动切开，逐题给答案。
+  </p>
+
+  <div class="entry-row">
+    <label class="entry">
+      <span class="ico">📷</span><span class="t">拍照</span>
+      <input type="file" accept="image/*" capture="environment" data-kind="camera">
+    </label>
+    <label class="entry">
+      <span class="ico">🖼️</span><span class="t">相册</span>
+      <input type="file" accept="image/*" data-kind="album">
+    </label>
+    <label class="entry">
+      <span class="ico">📄</span><span class="t">PDF</span>
+      <input type="file" accept="application/pdf,.pdf" data-kind="pdf">
+    </label>
+  </div>
+
+  <div id="preview-box" class="hidden">
+    <img id="preview" class="preview" alt="待处理的题图">
+    <div class="row">
+      <button class="primary" id="go">开始计算</button>
+      <button class="ghost" id="cancel">重选</button>
+    </div>
+  </div>
+
+  <details id="adv">
+    <summary>计算强度（默认够用）</summary>
+    <div class="adv-body">
+      <label>每步思考量
+        <select id="visits">
+          <option value="1500">快（1500 次，容易漏双解）</option>
+          <option value="3000" selected>标准（3000 次，推荐）</option>
+          <option value="6000">精算（6000 次，慢一倍）</option>
+        </select>
+      </label>
+      <label>变化步数
+        <select id="depth">
+          <option value="3">3 步</option>
+          <option value="4">4 步</option>
+          <option value="5" selected>5 步</option>
+        </select>
+      </label>
+      <label>双解判定容差
+        <select id="tol">
+          <option value="0.5">严（0.5 目）</option>
+          <option value="1.0" selected>标准（1 目）</option>
+          <option value="2.0">宽（2 目）</option>
+        </select>
+      </label>
+      <p class="tip">双解题会把所有等价正解各出一张图；全局实战题只给当前最大的一手。</p>
+    </div>
+  </details>
+</div>
+
+<div class="card hidden" id="progress-card">
+  <div class="prog-top">
+    <span id="prog-text">准备中…</span>
+    <span id="prog-count" class="mono"></span>
+  </div>
+  <div class="bar"><div id="prog-fill"></div></div>
+  <p class="tip" id="prog-tip">一题约 30~60 秒，不用停在这个页面——复制链接过会儿回来看也行。</p>
+</div>
+
+<div id="err" class="card hidden alert-box"></div>
+<div id="results"></div>
+
+<div id="loading" class="hidden">
+  <div class="spinner"></div>
+  <div id="loading-text">上传中…</div>
+</div>
+
+<footer>
+  <a class="link" href="/grade">批改模式（录入孩子的下法）</a>
+  <p class="tip">把这个网址「添加到主屏幕」，用起来和 App 一样。</p>
+</footer>
+
+<script src="/static/solve.js"></script>
+</body>
+</html>

@@ -19,6 +19,7 @@ from recognition import detect as D
 from recognition import corner
 import fullboard as F
 import solver
+from recognize_auto import recognize_auto
 
 # 题名按切分顺序（PDF 页面文字顺序）
 DEFAULT_NAMES = ["全局题1", "全局题2", "全局题3",
@@ -26,17 +27,11 @@ DEFAULT_NAMES = ["全局题1", "全局题2", "全局题3",
 
 
 def recognize(path):
-    """返回 (cols, rows, black, white, corner)。整盘优先，失败回退局部管线。"""
-    try:
-        r = F.recognize_full_board(path)
-        if r and r.get("cols", 0) >= 15:
-            return (r["cols"], r["rows"], list(r["black"]), list(r["white"]),
-                    "FULL")
-    except Exception:
-        pass
-    r = D.recognize(path)
-    c = corner.locate(path).get("corner") or "BR"
-    return r["cols"], r["rows"], list(r["black"]), list(r["white"]), c
+    """返回 (cols, rows, black, white, corner)。整盘优先，失败回退局部管线。
+
+    实现移到 recognize_auto.py，与 Web 端共用一份（避免两处分叉）。
+    """
+    return recognize_auto(path)
 
 
 def write_html(outdir, items, title="正解与变化图"):
